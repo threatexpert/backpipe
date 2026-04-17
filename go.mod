@@ -2,7 +2,7 @@ module github.com/threatexpert/backpipe
 
 go 1.24.4
 
-require github.com/threatexpert/gonc/v2 v2.0.0
+require github.com/threatexpert/gonc/v2 v2.5.0
 
 require (
 	github.com/creack/pty v1.1.24 // indirect

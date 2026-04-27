@@ -1,0 +1,60 @@
+name: Build Release
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.4'
+
+      - name: Build binaries
+        env:
+          LDFLAGS: "-s -w -buildid="
+          BUILD_FLAGS: "-buildvcs=false -trimpath"
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p bin
+          
+          # Windows
+          GOOS=windows GOARCH=amd64 go build $BUILD_FLAGS -ldflags="$LDFLAGS" -o bin/backpipe_windows_amd64.exe .
+          GOOS=windows GOARCH=arm64 go build $BUILD_FLAGS -ldflags="$LDFLAGS" -o bin/backpipe_windows_arm64.exe .
+          
+          # Darwin (macOS)
+          GOOS=darwin GOARCH=amd64 go build $BUILD_FLAGS -ldflags="$LDFLAGS" -o bin/backpipe_darwin_amd64 .
+          GOOS=darwin GOARCH=arm64 go build $BUILD_FLAGS -ldflags="$LDFLAGS" -o bin/backpipe_darwin_arm64 .
+          
+          # Linux Common (PC & 64-bit ARM)
+          GOOS=linux GOARCH=amd64 go build $BUILD_FLAGS -ldflags="$LDFLAGS" -o bin/backpipe_linux_amd64 .
+          GOOS=linux GOARCH=386 go build $BUILD_FLAGS -ldflags="$LDFLAGS" -o bin/backpipe_linux_386 .
+          GOOS=linux GOARCH=arm64 go build $BUILD_FLAGS -ldflags="$LDFLAGS" -o bin/backpipe_linux_arm64 .
+          
+          # Linux ARM 32-bit (精细化区分 v5 和 v7 软/硬浮点)
+          GOOS=linux GOARCH=arm GOARM=5 go build $BUILD_FLAGS -ldflags="$LDFLAGS" -o bin/backpipe_linux_armv5 .
+          GOOS=linux GOARCH=arm GOARM=7,softfloat go build $BUILD_FLAGS -ldflags="$LDFLAGS" -o bin/backpipe_linux_armv7_softfloat .
+          GOOS=linux GOARCH=arm GOARM=7 go build $BUILD_FLAGS -ldflags="$LDFLAGS" -o bin/backpipe_linux_armv7hf .
+          
+          # Linux MIPS (Routers / 软路由)
+          GOOS=linux GOARCH=mips GOMIPS=softfloat go build $BUILD_FLAGS -ldflags="$LDFLAGS" -o bin/backpipe_linux_mips .
+          GOOS=linux GOARCH=mipsle GOMIPS=softfloat go build $BUILD_FLAGS -ldflags="$LDFLAGS" -o bin/backpipe_linux_mipsle .
+          GOOS=linux GOARCH=mips64 go build $BUILD_FLAGS -ldflags="$LDFLAGS" -o bin/backpipe_linux_mips64 .
+          
+          # Android
+          GOOS=android GOARCH=arm64 go build $BUILD_FLAGS -ldflags="$LDFLAGS" -o bin/backpipe_android_arm64 .
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: bin/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

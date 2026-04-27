@@ -30,4 +30,4 @@ require (
 	golang.org/x/time v0.14.0 // indirect
 )
 
-replace github.com/threatexpert/gonc/v2 => ../gonetcat
+#replace github.com/threatexpert/gonc/v2 => ../gonetcat

@@ -26,7 +26,10 @@ import (
 	"github.com/threatexpert/gonc/v2/misc"
 )
 
+const Version = "0.1.0"
+
 func main() {
+	showVersion := flag.Bool("version", false, "show version and exit")
 	mode := flag.String("mode", "", "run mode: server or agent")
 	left := flag.String("left", "", "server: user listen addr; agent: server addr to connect")
 	right := flag.String("right", "", "server: agent pool listen addr; agent: target addr")
@@ -35,6 +38,11 @@ func main() {
 	proto := flag.String("proto", "plain", "tunnel protocol: plain or tls")
 	psk := flag.String("psk", "", "pre-shared key for TLS mutual authentication (required when -proto tls)")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println("backpipe", Version)
+		os.Exit(0)
+	}
 
 	if *proto == "tls" && *psk == "" {
 		log.Fatal("-psk is required when -proto tls")
@@ -414,9 +422,19 @@ func acceptPoolConns(ln net.Listener, pool *connPool, whitelist map[string]bool,
 }
 
 func statusTicker(pool *connPool) {
+	_idleOld := -1
+	_relaysOld := -1
+	_idle := 0
+	_relays := 0
 	for {
-		time.Sleep(2 * time.Second)
-		log.Printf("[server] status: idle=%d relays=%d", pool.size(), atomic.LoadInt64(&relayCount))
+		time.Sleep(1 * time.Second)
+		_idle = pool.size()
+		_relays = int(atomic.LoadInt64(&relayCount))
+		if _idle != _idleOld || _relays != _relaysOld {
+			log.Printf("[server] status: idle=%d relays=%d", _idle, _relays)
+			_idleOld = _idle
+			_relaysOld = _relays
+		}
 	}
 }
 
@@ -488,6 +506,13 @@ func runAgent(serverAddr, targetAddr string, poolSize int, proto, psk string) {
 func agentWorker(serverAddr, targetAddr string, spawn chan<- struct{}, tlsConf *tls.Config, s5sConf *apps.AppS5SConfig) {
 	id := nextAgentConnID()
 
+	respawn := func(delay time.Duration) {
+		if delay > 0 {
+			time.Sleep(delay)
+		}
+		spawn <- struct{}{}
+	}
+
 	// pre-establish connection to server
 	rawConn := dialRetry(serverAddr, id)
 
@@ -497,7 +522,7 @@ func agentWorker(serverAddr, targetAddr string, spawn chan<- struct{}, tlsConf *
 		if err := tlsConn.Handshake(); err != nil {
 			log.Printf("[agent-%d] TLS handshake failed: %v", id, err)
 			rawConn.Close()
-			spawn <- struct{}{} // replenish on failure
+			go respawn(5 * time.Second)
 			return
 		}
 		serverConn = tlsConn
@@ -513,7 +538,7 @@ func agentWorker(serverAddr, targetAddr string, spawn chan<- struct{}, tlsConf *
 	if err != nil {
 		log.Printf("[agent-%d] idle connection lost: %v", id, err)
 		serverConn.Close()
-		spawn <- struct{}{} // replenish on disconnect
+		go respawn(time.Second)
 		return
 	}
 
@@ -566,9 +591,7 @@ func dialRetry(addr string, id uint64) net.Conn {
 			setKeepalive(c)
 			return c
 		}
-		if attempt%10 == 0 {
-			log.Printf("[agent-%d] connect to server failed: %v, retry in %v", id, err, backoff)
-		}
+		log.Printf("[agent-%d] connect to server failed: %v, retry in %v", id, err, backoff)
 		time.Sleep(backoff)
 		if backoff < 30*time.Second {
 			backoff *= 2

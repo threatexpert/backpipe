@@ -20,7 +20,7 @@ jobs:
 
       - name: Build binaries
         env:
-          LDFLAGS: "-s -w -buildid="
+          LDFLAGS: "-s -w -buildid= -checklinkname=0"
           BUILD_FLAGS: "-buildvcs=false -trimpath"
           CGO_ENABLED: "0"
         run: |

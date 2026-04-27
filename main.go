@@ -26,7 +26,7 @@ import (
 	"github.com/threatexpert/gonc/v2/misc"
 )
 
-const Version = "0.1.0"
+const Version = "v1.0.1"
 
 func main() {
 	showVersion := flag.Bool("version", false, "show version and exit")

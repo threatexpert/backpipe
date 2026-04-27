@@ -24,9 +24,10 @@ import (
 
 	"github.com/threatexpert/gonc/v2/apps"
 	"github.com/threatexpert/gonc/v2/misc"
+	"github.com/threatexpert/gonc/v2/secure"
 )
 
-const Version = "v1.0.1"
+const Version = "v1.0.2"
 
 func main() {
 	showVersion := flag.Bool("version", false, "show version and exit")
@@ -38,6 +39,7 @@ func main() {
 	proto := flag.String("proto", "plain", "tunnel protocol: plain or tls")
 	psk := flag.String("psk", "", "pre-shared key for TLS mutual authentication (required when -proto tls)")
 	flag.Parse()
+	var err error
 
 	if *showVersion {
 		fmt.Println("backpipe", Version)
@@ -46,6 +48,13 @@ func main() {
 
 	if *proto == "tls" && *psk == "" {
 		log.Fatal("-psk is required when -proto tls")
+	}
+
+	if strings.HasPrefix(*psk, "@") {
+		*psk, err = secure.ReadPSKFile(*psk)
+		if err != nil {
+			log.Fatal("Error reading PSK file: ", err)
+		}
 	}
 
 	switch *mode {

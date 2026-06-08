@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/binary"
 	"encoding/pem"
 	"flag"
 	"fmt"
@@ -27,7 +28,7 @@ import (
 	"github.com/threatexpert/gonc/v2/secure"
 )
 
-const Version = "v1.0.2"
+const Version = "v1.0.3"
 
 func main() {
 	showVersion := flag.Bool("version", false, "show version and exit")
@@ -38,6 +39,7 @@ func main() {
 	allow := flag.String("allow", "", "server: agent IP whitelist, comma separated (e.g. 1.2.3.4,5.6.7.8)")
 	proto := flag.String("proto", "plain", "tunnel protocol: plain or tls")
 	psk := flag.String("psk", "", "pre-shared key for TLS mutual authentication (required when -proto tls)")
+	ppv2 := flag.Bool("left-ppv2", false, "server: inject PROXY protocol v2 header into agent stream (carries real client IP to target)")
 	flag.Parse()
 	var err error
 
@@ -63,7 +65,7 @@ func main() {
 			log.Fatal("server mode requires -left and -right")
 		}
 		whitelist := parseWhitelist(*allow)
-		runServer(*left, *right, whitelist, *proto, *psk)
+		runServer(*left, *right, whitelist, *proto, *psk, *ppv2)
 	case "agent":
 		if *left == "" || *right == "" {
 			log.Fatal("agent mode requires -left and -right")
@@ -232,6 +234,59 @@ func newAgentTLSConfig(psk string) (*tls.Config, error) {
 	}, nil
 }
 
+// ======================== PROXY protocol v2 ========================
+
+var proxyV2Magic = [12]byte{
+	0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D,
+	0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
+}
+
+// writeProxyV2 writes a PROXY protocol v2 header to dst, carrying the
+// client's real src address and the server's local dst address.
+// The header is prepended to the relay stream so the final target can
+// recover the original client IP/port.
+func writeProxyV2(dst net.Conn, src, local net.Addr) error {
+	srcTCP, ok1 := src.(*net.TCPAddr)
+	localTCP, ok2 := local.(*net.TCPAddr)
+	if !ok1 || !ok2 {
+		return fmt.Errorf("ppv2: non-TCP addresses")
+	}
+
+	var buf [16 + 36]byte // worst case: fixed header(16) + IPv6 addrs(36)
+	copy(buf[:12], proxyV2Magic[:])
+	buf[12] = 0x21 // version=2, command=PROXY
+
+	srcIP4 := srcTCP.IP.To4()
+	localIP4 := localTCP.IP.To4()
+
+	var n int
+	if srcIP4 != nil && localIP4 != nil {
+		buf[13] = 0x11 // family=INET, proto=STREAM
+		binary.BigEndian.PutUint16(buf[14:16], 12)
+		copy(buf[16:20], srcIP4)
+		copy(buf[20:24], localIP4)
+		binary.BigEndian.PutUint16(buf[24:26], uint16(srcTCP.Port))
+		binary.BigEndian.PutUint16(buf[26:28], uint16(localTCP.Port))
+		n = 28
+	} else {
+		srcIP6 := srcTCP.IP.To16()
+		localIP6 := localTCP.IP.To16()
+		if srcIP6 == nil || localIP6 == nil {
+			return fmt.Errorf("ppv2: cannot resolve IP to IPv6")
+		}
+		buf[13] = 0x21 // family=INET6, proto=STREAM
+		binary.BigEndian.PutUint16(buf[14:16], 36)
+		copy(buf[16:32], srcIP6)
+		copy(buf[32:48], localIP6)
+		binary.BigEndian.PutUint16(buf[48:50], uint16(srcTCP.Port))
+		binary.BigEndian.PutUint16(buf[50:52], uint16(localTCP.Port))
+		n = 52
+	}
+
+	_, err := dst.Write(buf[:n])
+	return err
+}
+
 // ======================== server mode ========================
 
 // poolEntry represents an idle agent connection in the pool
@@ -355,7 +410,7 @@ func (p *connPool) size() int {
 
 var relayCount int64 // atomic: active relay sessions
 
-func runServer(userAddr, poolAddr string, whitelist map[string]bool, proto, psk string) {
+func runServer(userAddr, poolAddr string, whitelist map[string]bool, proto, psk string, ppv2 bool) {
 	pool := newConnPool()
 
 	var tlsConf *tls.Config
@@ -392,7 +447,7 @@ func runServer(userAddr, poolAddr string, whitelist map[string]bool, proto, psk 
 			continue
 		}
 		log.Printf("[server] user connected: %s", uc.RemoteAddr())
-		go handleUserConn(uc, pool)
+		go handleUserConn(uc, pool, ppv2)
 	}
 }
 
@@ -447,19 +502,30 @@ func statusTicker(pool *connPool) {
 	}
 }
 
-func handleUserConn(userConn net.Conn, pool *connPool) {
+func handleUserConn(userConn net.Conn, pool *connPool, ppv2 bool) {
+	clientAddr := userConn.RemoteAddr()
+
 	agentConn := pool.pick(30 * time.Second)
 	if agentConn == nil {
-		log.Printf("[server] no agent connection available, dropping user: %s", userConn.RemoteAddr())
+		log.Printf("[server] no agent connection available, dropping user: %s", clientAddr)
 		userConn.Close()
 		return
 	}
 
+	if ppv2 {
+		if err := writeProxyV2(agentConn, userConn.RemoteAddr(), userConn.LocalAddr()); err != nil {
+			log.Printf("[server] ppv2 write failed for %s: %v", clientAddr, err)
+			userConn.Close()
+			agentConn.Close()
+			return
+		}
+	}
+
 	atomic.AddInt64(&relayCount, 1)
-	log.Printf("[server] relay started: %s <-> %s", userConn.RemoteAddr(), agentConn.RemoteAddr())
+	log.Printf("[server] relay started: %s <-> %s", clientAddr, agentConn.RemoteAddr())
 	relay(userConn, agentConn)
 	atomic.AddInt64(&relayCount, -1)
-	log.Printf("[server] relay ended: %s", userConn.RemoteAddr())
+	log.Printf("[server] relay ended: %s", clientAddr)
 }
 
 // ======================== agent mode ========================

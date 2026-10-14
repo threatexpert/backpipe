@@ -1,17 +1,48 @@
 # backpipe
 
-轻量级反向隧道与代理工具。agent 主动连接 server，维持预建立的 TCP 连接池并自动补池，支持固定目标 TCP 转发、SOCKS5 TCP/UDP 和 HTTP 代理，以及可选的 TLS+PSK 双向认证。
+backpipe 由 server 和 agent 组成。server 提供普通或加密的 SOCKS5/HTTP 代理服务；agent 部署在出口节点，主动连接 server 建立加密隧道，为 server 转发出站流量。server 的代理请求通过这些已有连接交给 agent 处理，因此从连接建立方向看，始终是 agent 主动连接 server。
+
+## 加密快速开始
+
+在 server 上同时开启公网加密入口、本地普通入口和加密连接池入口：
+
+```sh
+backpipe server -listen "socks5s://:1080?psk=client-key" -listen "socks5://127.0.0.1:3180" -accept "tls://:10086?psk=tunnel-key"
+```
+
+在 agent 上主动连接 server，维持 20 条空闲加密连接：
+
+```sh
+backpipe agent -connect "tls://server_host:10086?psk=tunnel-key" -pool 20
+```
+
+将 `server_host` 替换为 server 的地址，`client-key` 和 `tunnel-key` 替换为实际密钥；agent 与 server 的连接池密钥必须一致。
+
+| 地址 | 用途 |
+|------|------|
+| `server_host:1080` | 公网加密代理入口，客户端使用 gonc 兼容的 TLS+PSK 协议，密钥为 `client-key` |
+| `127.0.0.1:3180` | server 本机应用使用的普通 SOCKS5/HTTP 入口，省去本地接入的加密开销 |
+| `server_host:10086` | agent 主动连接的加密连接池入口，密钥为 `tunnel-key` |
+
+两个代理入口共享连接池，均支持 SOCKS5 TCP/UDP 和 HTTP。server 到 agent 的业务请求通过加密池连接传输。公网使用 UDP 时，还需允许访问 server 动态分配的 UDP 端口，详见后面的“UDP 行为与公网部署”。
+
+## 工作原理
+
+连接建立方向和业务请求方向不同：
 
 ```text
-客户端 → server 的 -listen 入口 ← TCP/TLS 预连接池 ← agent → 目标服务
-                  -accept 接收连接              -connect 主动连接
+预先建立连接：agent ── TCP + TLS/PSK ──→ server
+业务请求流向：客户端 → server ── 已建立的加密连接 ──→ agent → 目标服务
+响应返回路径：客户端 ← server ←─────────────────── agent ← 目标服务
 ```
+
+从连接建立过程看，连接由 agent 主动发起到 server；server 需要通过 agent 访问目标时，使用已经建立的连接发送请求，无需向 agent 新建入站连接。这使 server 发起的反向业务访问承载在 agent 主动出站的 TLS 连接中，agent 无需开放用于接入 server 的监听端口。
 
 每个会话独占一条连接，不使用 mux 多路复用。TCP 建立成功后（启用 TLS 时则在认证成功后），连接直接进入空闲池，不额外发送 backpipe 注册消息或应用层 ACK。首个业务请求激活连接后，agent 立即建立新连接补充空闲池。
 
 `-pool` 指定的是**空闲连接数**，不是并发会话上限。已使用的连接在会话结束后关闭，不放回池中。
 
-## SOCKS5 快速开始
+## 普通代理入口与用户名认证
 
 ```sh
 # server：1080 为客户端入口，10086 为 agent 连接池入口

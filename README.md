@@ -1,184 +1,213 @@
 # backpipe
 
-A reverse tunnel with fixed-target TCP forwarding and a server-side SOCKS5 TCP/UDP and HTTP proxy. The **agent** dials out to the **server** and maintains a pool of idle TCP connections. Each session uses its own connection, without mux channels. The agent immediately replenishes the pool when a session starts.
+轻量级反向隧道与代理工具。agent 主动连接 server，维持预建立的 TCP 连接池并自动补池，支持固定目标 TCP 转发、SOCKS5 TCP/UDP 和 HTTP 代理，以及可选的 TLS+PSK 双向认证。
 
+```text
+客户端 → server 的 -listen 入口 ← TCP/TLS 预连接池 ← agent → 目标服务
+                  -accept 接收连接              -connect 主动连接
 ```
-client -> server (-listen) <- pooled TCP/TLS connections <- agent -> destination
-                     (-accept)                         (-connect)
-```
 
-Pool connections enter the idle pool immediately after TCP connection establishment (or TLS authentication when enabled). There is no backpipe registration message or application-level ACK. The first business request activates the agent connection and triggers replenishment. Update both peers together when replacing builds that used the earlier registration exchange.
+每个会话独占一条连接，不使用 mux 多路复用。TCP 建立成功后（启用 TLS 时则在认证成功后），连接直接进入空闲池，不额外发送 backpipe 注册消息或应用层 ACK。首个业务请求激活连接后，agent 立即建立新连接补充空闲池。
 
-`-pool` is the desired number of **idle** connections, not a limit on active sessions. Used connections are closed when sessions end; they do not return to the pool.
+`-pool` 指定的是**空闲连接数**，不是并发会话上限。已使用的连接在会话结束后关闭，不放回池中。
 
-## SOCKS5 quick start
+## SOCKS5 快速开始
 
 ```sh
-# Server: client entry on 1080, agent pool on 10086
+# server：1080 为客户端入口，10086 为 agent 连接池入口
 backpipe server -listen socks5://:1080 -accept :10086
 
-# Agent: omit -target to serve SOCKS5 TCP/UDP requests
+# agent：不指定 -target，即作为 SOCKS5 TCP/UDP 和 HTTP 代理出口
 backpipe agent -connect server_host:10086 -pool 20
 ```
 
-The server authenticates proxy clients and assigns pool connections. The agent resolves domains and connects to destinations. Each SOCKS5 entry automatically accepts SOCKS5 CONNECT/UDP ASSOCIATE, HTTP CONNECT and ordinary HTTP/1.x proxy requests. SOCKS5 BIND is not supported.
+server 负责客户端认证和连接池分配；agent 负责解析目标域名、连接目标服务。每个 SOCKS5 入口同时支持 SOCKS5 CONNECT、UDP ASSOCIATE、HTTP CONNECT 和普通 HTTP/1.x 代理请求。不支持 SOCKS5 BIND。
 
-Optional SOCKS5 username/password:
+需要用户名和密码时，在入口 URL 中配置：
 
 ```sh
 backpipe server -listen "socks5://user:pass@:1080" -accept :10086
 ```
 
-Without credentials in the URL, the entry permits anonymous SOCKS5 and HTTP proxy access.
+未配置用户名和密码时，该入口允许匿名 SOCKS5 和 HTTP 代理访问。
 
-## HTTP compatibility on the same port
+## 同端口兼容 HTTP 代理
 
-No extra flag or listener is required. A plain `socks5://` entry accepts ordinary SOCKS5 and HTTP proxies; `socks5s://` accepts both protocols **after** the same TLS+PSK handshake.
+无需额外参数或监听端口。`socks5://` 入口自动识别 SOCKS5 和 HTTP；`socks5s://` 入口先完成 TLS+PSK 握手，再识别内部的 SOCKS5 或 HTTP 请求。
 
 ```sh
-backpipe server -listen "socks5s://:1080?psk=123" -listen "socks5://127.0.0.1:3180" -accept "tls://:10086?psk=456"
-backpipe agent -connect "tls://server_host:10086?psk=456" -pool 20
+backpipe server -listen "socks5s://:1080?psk=client-key" -listen "socks5://127.0.0.1:3180" -accept "tls://:10086?psk=tunnel-key"
+backpipe agent -connect "tls://server_host:10086?psk=tunnel-key" -pool 20
 
-# Local HTTP proxy: ordinary HTTP forwarding and HTTPS through CONNECT
+# 本地 HTTP 代理：普通 HTTP 转发，以及通过 CONNECT 访问 HTTPS
 curl -x http://127.0.0.1:3180 http://example.com/
 curl -x http://127.0.0.1:3180 https://example.com/
 
-# gonc HTTP CONNECT over the encrypted public entry
-gonc -x "https://server_host:1080?psk=123" target_host target_port
+# gonc 通过公网加密入口使用 HTTP CONNECT
+gonc -x "https://server_host:1080?psk=client-key" target_host target_port
 ```
 
-Clients can select SOCKS5 or HTTP on the same entry. HTTP/HTTPS URL schemes in these examples configure the **client**; server `-listen` schemes remain `socks5://` and `socks5s://` for these combined entries. An ordinary HTTPS-proxy client without gonc-compatible PSK authentication cannot connect to a `socks5s://` entry.
+示例中的 `http://`、`https://` 是**客户端**的代理配置；server 的混合代理入口仍使用 `-listen socks5://...` 或 `-listen socks5s://...`。不支持 gonc PSK 认证的普通 HTTPS 代理客户端，不能直接连接加密入口。
 
-When an entry has `user:password`, HTTP uses Basic `Proxy-Authorization` and returns `407 Proxy Authentication Required` for missing/incorrect credentials before taking a pool connection. For gonc CONNECT compatibility, CONNECT also accepts Basic `Authorization` when `Proxy-Authorization` is absent. Ordinary HTTP preserves `Authorization` for the origin server; proxy credentials are removed before forwarding.
+入口配置了 `user:password` 时，HTTP 使用 Basic `Proxy-Authorization` 认证。缺少凭据或认证失败时返回 `407 Proxy Authentication Required`，不占用连接池。为兼容 gonc，CONNECT 请求在没有 `Proxy-Authorization` 时也接受 Basic `Authorization`。普通 HTTP 请求的 `Authorization` 保留给目标网站；代理认证信息在转发前移除。
 
-Ordinary HTTP supports streamed request/response bodies, chunked uploads and `Expect: 100-continue`. Each ordinary HTTP transaction uses one pool connection and closes the client connection after the response (no HTTP proxy keep-alive or direct protocol upgrades). CONNECT becomes a bidirectional TCP tunnel, including half-close, and can carry HTTPS. HTTP headers are limited to 64 KiB. UDP continues to use SOCKS5 UDP ASSOCIATE, not HTTP.
+普通 HTTP 支持请求和响应正文的流式传输、分块上传和 `Expect: 100-continue`。每次普通 HTTP 请求使用一条池连接，响应完成后关闭客户端连接，不支持 HTTP 代理连接复用或直接协议升级。CONNECT 建立双向 TCP 隧道，支持半关闭，可承载 HTTPS。HTTP 请求头上限为 64 KiB。UDP 仍通过 SOCKS5 UDP ASSOCIATE 使用。
 
-## Multiple entries sharing one pool
+## 多个入口共享连接池
 
-Repeat `-listen` to expose an encrypted public entry and a plain loopback entry in the same server:
+重复指定 `-listen`，即可同时提供公网加密入口和本地普通入口：
 
 ```sh
-backpipe server -listen "socks5s://:1080?psk=123" -listen "socks5://127.0.0.1:3180" -accept "tls://:10086?psk=456"
-backpipe agent -connect "tls://server_host:10086?psk=456" -pool 20
+backpipe server -listen "socks5s://:1080?psk=client-key" -listen "socks5://127.0.0.1:3180" -accept "tls://:10086?psk=tunnel-key"
+backpipe agent -connect "tls://server_host:10086?psk=tunnel-key" -pool 20
 ```
 
-Both entries support TCP and UDP. Public clients use `socks5s://server_host:1080?psk=123`; local applications use ordinary SOCKS5 at `127.0.0.1:3180`. The local entry avoids client-side TLS and UDP encryption while the shared server-agent tunnel remains encrypted.
+两个入口都支持 TCP 和 UDP。公网客户端连接 `socks5s://server_host:1080?psk=client-key`；本地应用连接 `127.0.0.1:3180`，使用普通 SOCKS5 或 HTTP 代理。本地入口省去客户端到 server 的加密开销，server 到 agent 的连接池仍然加密。
 
-Add more `-listen` options as needed. Each entry has its own address, username/password and PSK; credentials on one entry do not apply to another. All entries draw from the same idle pool, so `-pool 20` means 20 idle connections in total. Closing a session on one entry does not close sessions on other entries.
+每个入口可以独立配置监听地址、用户名、密码和 PSK，不同入口的凭据互不通用。所有入口共享同一个空闲池，`-pool 20` 表示总共维持 20 条空闲连接。关闭某个入口上的会话，不影响其他入口的会话。
 
-Every listening port (including `-accept`) must bind successfully before any traffic is served. If a bind fails, the server releases the ports it already bound and exits with an error identifying the failed entry. Logs include each entry's address and scheme, without its credentials.
+所有监听端口（包括 `-accept`）均绑定成功后才开始提供服务。任一端口绑定失败，server 会释放此前已绑定的端口，并报告失败的入口。日志显示入口地址和协议，不输出凭据。
 
-`-udp-timeout` and `-socks-server-ip` remain shared server options. By default each UDP association advertises `0.0.0.0`, matching gonc. Compatible clients use the TCP control connection's peer IP, so public and loopback clients use their respective entry addresses. Setting `-socks-server-ip` overrides the advertised IP for **all** entries, including loopback entries.
+`-udp-timeout` 和 `-socks-server-ip` 是所有入口共用的 server 参数。默认 UDP 回复地址为 `0.0.0.0`，与 gonc 一致。兼容客户端会使用 TCP 控制连接的对端 IP，因此公网和本地客户端分别使用各自连接的入口地址。显式设置 `-socks-server-ip` 会覆盖**所有入口**的回复 IP，包括本地入口。
 
-Multiple `tcp://` entries can also share a fixed-target pool, but mixing `tcp://` with SOCKS5 entries in one server is rejected because their agent modes differ.
+多个 `tcp://` 入口也可以共享固定目标连接池。由于 agent 工作模式不同，同一个 server 不允许混用 `tcp://` 和 SOCKS5 入口。
 
-## Encryption
+## 加密与认证
 
-Client entry encryption and server-agent tunnel encryption are configured independently:
+客户端入口和 server-agent 连接池的加密独立配置：
 
-| Endpoint | Plain | TLS + PSK |
-|----------|-------|-----------|
-| Client entry (`-listen`) | `socks5://:1080` | `socks5s://:1080?psk=client-key` |
-| Pool listener (`-accept`) | `:10086` | `tls://:10086?psk=tunnel-key` |
-| Agent connection (`-connect`) | `server_host:10086` | `tls://server_host:10086?psk=tunnel-key` |
+| 位置 | 明文 | TLS+PSK |
+|------|------|---------|
+| 客户端入口 `-listen` | `socks5://:1080` | `socks5s://:1080?psk=client-key` |
+| 连接池监听 `-accept` | `:10086` | `tls://:10086?psk=tunnel-key` |
+| agent 连接 `-connect` | `server_host:10086` | `tls://server_host:10086?psk=tunnel-key` |
 
-Encrypt only the server-agent tunnel, keeping an ordinary SOCKS5 entry:
+仅加密连接池，保留普通代理入口：
 
 ```sh
 backpipe server -listen socks5://:1080 -accept "tls://:10086?psk=tunnel-key"
 backpipe agent -connect "tls://server_host:10086?psk=tunnel-key" -pool 20
 ```
 
-Encrypt both the client entry and the pool:
+同时加密客户端入口和连接池：
 
 ```sh
 backpipe server -listen "socks5s://:1080?psk=client-key" -accept "tls://:10086?psk=tunnel-key"
 backpipe agent -connect "tls://server_host:10086?psk=tunnel-key" -pool 20
 ```
 
-`socks5s` uses gonc-compatible TLS 1.2/1.3 with PSK mutual authentication for the SOCKS control/TCP connection. UDP uses a separate key exported from each TLS session and gonc's encrypted UDP wire format. Both requests and replies are encrypted between the client and server. This entry requires a compatible client, such as gonc:
+入口和连接池都使用与 gonc 兼容的 TLS 1.2/1.3 协议，以及 PSK 派生的证书进行双向认证。这是基于证书的双向 TLS，不是 TLS 原生的外部 PSK 认证。相同 PSK 在两种连接上使用相同的密钥派生方式，但 TLS 内部承载的应用协议不同，两个端口不能互换。
+
+双方都支持时优先协商 TLS 1.3，同时兼容仅支持 TLS 1.2 的客户端。拒绝 TLS 1.0/1.1；TLS 1.2 仅允许以下具有前向安全性的套件：
+
+- `TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256`
+- `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384`
+- `TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256`
+
+握手成功后，日志会显示实际协商的 TLS 版本和密码套件。
+
+`socks5s` 的控制连接和 TCP 数据通过 TLS 传输。独立 UDP 数据报使用每个 TLS 会话导出的密钥，并采用 gonc 的加密 UDP 格式，客户端到 server 的请求和回复均加密。可使用 gonc 等兼容客户端：
 
 ```sh
-# TCP through the encrypted entry
+# 通过加密入口转发 TCP
 gonc -x "socks5s://server_host:1080?psk=client-key" target_host target_port
 
-# UDP through the same encrypted entry
+# 通过同一入口转发 UDP
 gonc -x "socks5s://server_host:1080?psk=client-key" -u target_host target_port
 ```
 
-Entry and pool PSKs may differ. TLS schemes require a nonempty PSK; adding `psk` to a plain scheme is rejected. The compatible UDP format uses AES-CTR with a random IV; it provides encryption but no per-datagram authentication or replay protection. The agent sends ordinary TCP/UDP to the destination unless the application itself encrypts its traffic.
+入口与连接池可以使用不同 PSK。加密地址必须配置非空 PSK；明文地址不接受 `psk` 参数。示例中的密钥仅作说明，实际部署请使用高强度随机密钥。
 
-The pool and SOCKS entry share gonc-compatible TLS 1.2/1.3 handshakes and PSK-derived certificate authentication. The same PSK uses the same key derivation on either endpoint. After TLS, the pool speaks the tunnel request protocol and the entry speaks SOCKS5 or HTTP, so these ports are not interchangeable. This is certificate-based mutual TLS, not native TLS external-PSK authentication. TLS 1.3 is negotiated when both peers support it; TLS 1.2-only clients are also supported. TLS 1.0/1.1 are rejected. TLS 1.2 permits only ECDHE-ECDSA with AES-128-GCM, AES-256-GCM, or ChaCha20-Poly1305, providing forward secrecy. Successful handshakes log the negotiated version and cipher suite.
+兼容 gonc 的 UDP 格式使用 AES-CTR 和随机 IV，提供加密，但没有逐包消息认证或防重放保护。agent 到目标服务使用普通 TCP/UDP，除非应用协议自身也提供加密。
 
-Pool TLS is incompatible with older backpipe binaries that used the `backpipe-ecdsa-psk-derive` derivation. Upgrade both server and agent together; there is no fallback to the old handshake. Command syntax is unchanged.
+旧版 backpipe 曾使用 `backpipe-ecdsa-psk-derive` 派生密钥，与当前连接池认证不兼容。升级时请同时更新 server 和 agent。若旧构建包含注册握手，也应同时更新两端；当前不再使用该握手。
 
-### Credentials and key files
+### 凭据与密钥文件
 
-Quote URLs and URL-encode special characters in credentials/query values: for example, `%40` for `@`, `%26` for `&`, `%23` for `#`, `%2B` for a literal `+` in a PSK, and `%20` for a space. Username and password each support 1..255 decoded bytes.
+包含凭据或查询参数的 URL 应用引号包住。特殊字符需要 URL 编码，例如：`@` 为 `%40`、`&` 为 `%26`、`#` 为 `%23`、PSK 中的加号为 `%2B`、空格为 `%20`。用户名和密码解码后分别支持 1～255 字节。
 
-Use `psk=@file` to read a key from a local file's first line (surrounding whitespace is trimmed). Relative paths resolve from the working directory. Empty keys and unreadable files are rejected.
+使用 `psk=@文件路径` 从文件第一行读取密钥，自动去掉首尾空白。支持绝对路径；相对路径以程序启动时的工作目录为基准。空密钥或无法读取的文件会报错。
 
 ```sh
 backpipe server -listen "socks5s://:1080?psk=@client.key" -accept "tls://:10086?psk=@tunnel.key"
 backpipe agent -connect "tls://server_host:10086?psk=@tunnel.key" -pool 20
+
+# Windows 绝对路径示例
+backpipe agent -connect "tls://server_host:10086?psk=@D:/keys/tunnel.key" -pool 20
 ```
 
-Logs and parsing diagnostics omit URL credentials and PSKs. Key files also avoid putting literal keys in the process command line.
+URL 的第一个查询参数使用 `?psk=`，已有其他参数时使用 `&psk=`。日志和参数解析错误不输出 URL 中的凭据和 PSK。使用密钥文件也能避免把密钥明文放进进程命令行。
 
-## Fixed TCP target
+## 固定目标 TCP 转发
 
-Use a `tcp://` listener and give the agent a target:
+server 使用 `tcp://` 入口，agent 指定目标地址：
 
 ```sh
 backpipe server -listen tcp://:8080 -accept :10086
 backpipe agent -connect server_host:10086 -target 127.0.0.1:80 -pool 20
 ```
 
-The pool can use `tls://host:port?psk=key` just as in SOCKS5 mode. `-target` accepts `host:port` or `tcp://host:port`. Add `-ppv2` on the server to send a PROXY v2 header to a target that understands it.
+连接池同样支持 `tls://host:port?psk=key`。`-target` 接受 `host:port` 或 `tcp://host:port`。目标服务支持 PROXY v2 时，可在 server 添加 `-ppv2`，向目标发送包含客户端地址的 PROXY v2 头。
 
-Match both peers: SOCKS5 listeners require agents **without** `-target`; TCP listeners require agents **with** `-target`. Use separate server processes/pool ports for these two modes.
+两端模式必须匹配：SOCKS5 入口对应**不带** `-target` 的 agent；TCP 入口对应**带** `-target` 的 agent。需要同时使用两种模式时，请分别运行 server 进程并使用不同的连接池端口。
 
-## UDP behavior
+## UDP 行为与公网部署
 
-- Each UDP ASSOCIATE reserves one pool connection and creates an ephemeral UDP relay port on the **server**. The SOCKS reply advertises `0.0.0.0` (or the explicitly configured `-socks-server-ip`) and the allocated UDP port. The socket itself remains bound to the accepted TCP connection's local IP. An association can contact multiple destinations.
-- Datagrams are framed over the TCP/TLS pool connection, then sent as UDP by the agent. TCP retransmission can delay datagrams in the same association.
-- Keep the SOCKS TCP control connection open. Closing it, losing the tunnel, or reaching the idle timeout closes the association and its UDP sockets.
-- Default idle timeout: `2m`. Set `-udp-timeout 5m` on both peers to change it; the shorter timeout takes effect.
-- Permit inbound UDP to the allocated ephemeral ports; opening only UDP/1080 is insufficient. Fixed/shared UDP ports and configurable relay port ranges are not implemented.
-- For a server behind NAT, clients that support the default `0.0.0.0` reply use the proxy IP they connected to. Set `-socks-server-ip PUBLIC_IP` if an explicit advertised IP is needed. Forward the allocated UDP ports without changing their numbers; this option does not create mappings.
-- UDP source IP must match the control TCP peer. The first valid packet pins the actual source port. The address/port in UDP ASSOCIATE is not used for filtering, supporting gonc and clients behind NAT. Fragmented SOCKS5 packets are dropped.
+- 每个 UDP ASSOCIATE 占用一条池连接，并在 **server** 上分配一个临时 UDP 端口；一个会话可以访问多个目标。
+- 默认向客户端回复 `0.0.0.0` 和实际分配的端口；显式指定 `-socks-server-ip` 时使用配置 IP。实际 socket 仍绑定在 TCP 控制连接的本机 IP 上。
+- 客户端 UDP 包通过 server-agent 的 TCP/TLS 连接封装转发，再由 agent 以 UDP 发往目标。TCP 重传可能延迟同一会话中的后续数据报。
+- SOCKS TCP 控制连接必须保持打开。控制连接关闭、隧道断开或空闲超时，都会结束 UDP 会话并关闭相关 socket。
+- 默认空闲超时为 `2m`。修改时可在两端都设置 `-udp-timeout 5m`；两端不一致时，较短的超时会先触发。
+- 防火墙和安全组需要允许访问动态分配的 UDP 端口，仅开放 UDP/1080 不够。目前不支持固定或共享 UDP 端口，也不支持配置分配端口范围。
+- server 位于 NAT 后时，支持 `0.0.0.0` 回退的客户端会使用所连接的代理 IP。需要明确指定回复地址时，可设置 `-socks-server-ip 公网IP`。NAT 仍需将分配的 UDP 端口按同号映射到 server，此参数不会自动创建映射。
+- UDP 来源 IP 必须与 TCP 控制连接的对端 IP 一致；首个有效数据包确定实际来源端口。不会拿 UDP ASSOCIATE 请求里的地址和端口过滤数据，兼容 gonc 及 NAT 后的客户端。不支持分片 SOCKS5 UDP 数据报。
 
-## Options
+排查时可关注这些日志：
 
-Run `backpipe server -help` or `backpipe agent -help` for role-specific help.
+| 日志 | 含义 |
+|------|------|
+| `[server] UDP association: ... via ...` | server 和 agent 已准备好 UDP 会话；`via` 显示实际监听地址，不是回复给客户端的地址 |
+| `[server] UDP client bound: ...` | server 收到并接受了首个有效客户端 UDP 包 |
+| `[agent] UDP forwarding: ... -> ...` | agent 首次成功将 UDP 包交给本机 socket 发往目标，不代表目标已收到或回复 |
+| `[server] UDP association ended: ... (sent=N received=M packets)` | 会话结束；`sent` 为成功写入 agent 隧道的包数，`received` 为从隧道返回并成功写入客户端 UDP socket 的包数 |
 
-| Option | Role | Default / purpose |
-|--------|------|-------------------|
-| `-listen` | server | Required, repeatable: `tcp://`, `socks5://`, or `socks5s://` client entry |
-| `-accept` | server | Required: agent pool listener; bare address, `tcp://`, or `tls://` |
-| `-connect` | agent | Required: server pool address; bare address, `tcp://`, or `tls://` |
-| `-target` | agent | Omit for SOCKS5 exit; set for fixed TCP forwarding |
-| `-pool` | agent | `5` idle connections |
-| `-allow` | server | Comma-separated agent IP whitelist; empty permits all agent IPs |
-| `-ppv2` | server | `false`; PROXY v2 header, TCP listener only |
-| `-socks-server-ip` | server | SOCKS UDP advertised IP; defaults to `0.0.0.0` (client uses TCP peer IP) |
-| `-udp-timeout` | both | `2m`; SOCKS5 mode only |
-| `-version` | global | Print version and exit |
+## 参数说明
 
-This CLI replaces the old `-mode/-left/-right/-socks5/-proto/-psk/-socks-auth/-left-ppv2` options. Old commands and the agent-side `:s5s` target are no longer accepted. Configure SOCKS5 on the server using `-listen` instead.
+使用 `backpipe server -help` 或 `backpipe agent -help` 查看对应角色的帮助。
 
-## Build and test
+| 参数 | 角色 | 默认值与用途 |
+|------|------|--------------|
+| `-listen` | server | 必填，可重复；客户端入口，支持 `tcp://`、`socks5://`、`socks5s://` |
+| `-accept` | server | 必填；agent 连接池监听地址，支持裸地址、`tcp://`、`tls://` |
+| `-connect` | agent | 必填；server 连接池地址，支持裸地址、`tcp://`、`tls://` |
+| `-target` | agent | 省略时作为代理出口；指定时进行固定目标 TCP 转发 |
+| `-pool` | agent | `5`；要维持的空闲连接数 |
+| `-allow` | server | agent IP 白名单，以逗号分隔；留空时不限制 agent IP |
+| `-ppv2` | server | `false`；发送 PROXY v2 头，仅支持 TCP 入口 |
+| `-socks-server-ip` | server | UDP 回复 IP；默认 `0.0.0.0`，由兼容客户端使用 TCP 对端 IP |
+| `-udp-timeout` | 两端 | `2m`；代理模式下的 UDP 空闲超时 |
+| `-version` | 全局 | 输出版本并退出 |
+
+当前命令行已替代旧的 `-mode/-left/-right/-socks5/-proto/-psk/-socks-auth/-left-ppv2` 参数，不兼容旧命令，也不再接受 agent 侧的 `:s5s` 目标。请通过 server 的 `-listen` 配置代理入口。
+
+## 构建与测试
+
+需要 Go 1.26.8 或更高版本。
 
 ```sh
-go build -o backpipe .
+go build -o bin/backpipe .
 go test ./...
 go vet ./...
 ```
 
-Requires Go 1.26.8+. The gonc dependency is pinned to commit `41d3f96c03fec9fbcf7ed9524b61792fca61ebee` via `v2.6.11-0.20261013082942-41d3f96c03fe`, without a local `replace`. No additional gonc release is needed.
+Windows 下可运行 `build.bat` 构建 Windows 和 Linux amd64 程序，产物位于 `bin/`，该目录已由 Git 忽略。
 
-Tests exercise real server/agent processes, simultaneous plain/encrypted entries sharing a pool, startup rollback on port conflicts, gonc TCP/UDP and HTTP CONNECT clients, HTTP GET/POST and HTTPS forwarding, plain/encrypted pools, PSK rejection, per-session UDP encryption, SOCKS authentication, half-close, idle cleanup, reconnect/replenishment, and fixed-target forwarding. TCP uses gonc's exported tunnel handlers. UDP framing is compatible with gonc, while backpipe owns UDP session cleanup to avoid the pinned handler's wait-group and shared-address issues.
+gonc 依赖固定到提交 `41d3f96c03fec9fbcf7ed9524b61792fca61ebee`，对应伪版本 `v2.6.11-0.20261013082942-41d3f96c03fe`。不使用本地 `replace`，也无需额外发布 gonc 版本。
 
-## License
+测试覆盖真实 server/agent 进程、普通和加密多入口共享连接池、端口绑定失败回滚、gonc TCP/UDP 及 HTTP CONNECT 兼容、HTTP GET/POST 和 HTTPS 转发、PSK 拒绝、TLS 版本与套件协商、每会话 UDP 加密、SOCKS 认证、半关闭、空闲清理、断线重连、自动补池和固定目标转发。
+
+TCP 转发使用 gonc 导出的隧道处理接口。UDP 帧格式与 gonc 兼容，会话清理由 backpipe 自行管理，以避开所固定依赖版本中的等待组和共享地址问题。
+
+## 许可证
 
 MIT

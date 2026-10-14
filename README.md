@@ -28,15 +28,29 @@ backpipe agent -connect "tls://server_host:10086?psk=tunnel-key" -pool 20
 
 ## 工作原理
 
-连接建立方向和业务请求方向不同：
+以通过上游出口节点访问 TCP 目标为例，常规代理链和 backpipe 的区别在于 **server 与出口节点之间，谁主动建立连接**。下图箭头表示 TCP 连接的发起方向，即首个 SYN 的发送方向；三次握手本身是双向交互，不表示数据只能沿箭头单向传输。
 
 ```text
-预先建立连接：agent ── TCP + TLS/PSK ──→ server
-业务请求流向：客户端 → server ── 已建立的加密连接 ──→ agent → 目标服务
-响应返回路径：客户端 ← server ←─────────────────── agent ← 目标服务
+常规代理链：由 SOCKS5 server 主动连接上游出口节点
+
+用户客户端 ──→ SOCKS5 server ──→ upstream node ──→ target
+
+backpipe：由上游出口节点 agent 主动连接 server
+
+用户客户端 ──→ backpipe server ←── agent ──→ target
+                SOCKS5 入口        出口节点
 ```
 
-从连接建立过程看，连接由 agent 主动发起到 server；server 需要通过 agent 访问目标时，使用已经建立的连接发送请求，无需向 agent 新建入站连接。这使 server 发起的反向业务访问承载在 agent 主动出站的 TLS 连接中，agent 无需开放用于接入 server 的监听端口。
+backpipe 中，agent 提前向 server 发起 TCP 连接；启用加密时，再由 agent 作为 TLS 客户端完成 TLS+PSK 双向认证，形成空闲连接池。用户请求到达后，server 从池中取出一条已有连接，将代理请求发送给 agent，由 agent 主动连接 target。server 无需再向 agent 发起 TCP 连接，agent 也无需开放供 server 接入的监听端口。
+
+改变的是中间这一段的**连接发起方向**，业务请求和响应的路径仍然是：
+
+```text
+请求：用户客户端 → server → agent → target
+响应：用户客户端 ← server ← agent ← target
+```
+
+以上握手方向示例针对 TCP 目标。代理 UDP 时，server-agent 之间仍使用 agent 主动建立的 TCP/TLS 池连接，agent 到 target 则发送 UDP 数据报，没有 TCP 握手。
 
 每个会话独占一条连接，不使用 mux 多路复用。TCP 建立成功后（启用 TLS 时则在认证成功后），连接直接进入空闲池，不额外发送 backpipe 注册消息或应用层 ACK。首个业务请求激活连接后，agent 立即建立新连接补充空闲池。
 

@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-const Version = "v1.2.0"
+const Version = "v1.3.0"
 
 func main() {
 	if err := runCLI(os.Args[1:], os.Stdout); err != nil {
@@ -250,9 +250,29 @@ func (p *connPool) size() int {
 
 var relayCount int64 // atomic: active relay sessions
 
+// A client entry binds one transport; UDP has no Accept operation.
+type serverListener struct {
+	tcp net.Listener
+	udp *net.UDPConn
+}
+
+func (ln serverListener) Addr() net.Addr {
+	if ln.udp != nil {
+		return ln.udp.LocalAddr()
+	}
+	return ln.tcp.Addr()
+}
+
+func (ln serverListener) Close() error {
+	if ln.udp != nil {
+		return ln.udp.Close()
+	}
+	return ln.tcp.Close()
+}
+
 // Bind every port before starting any accept loop. On failure, release all
 // successfully bound ports so startup cannot leave a partially serving server.
-func bindServerListeners(entries []entryConfig, poolAddr string) (net.Listener, []net.Listener, error) {
+func bindServerListeners(entries []entryConfig, poolAddr string) (net.Listener, []serverListener, error) {
 	if len(entries) == 0 {
 		return nil, nil, fmt.Errorf("at least one client entry is required")
 	}
@@ -260,9 +280,18 @@ func bindServerListeners(entries []entryConfig, poolAddr string) (net.Listener, 
 	if err != nil {
 		return nil, nil, fmt.Errorf("agent pool listen on %s: %w", poolAddr, err)
 	}
-	var listeners []net.Listener
+	var listeners []serverListener
 	for i, entry := range entries {
-		ln, err := net.Listen("tcp", entry.endpoint.address)
+		var ln serverListener
+		if entry.endpoint.scheme == "udp" {
+			var addr *net.UDPAddr
+			addr, err = net.ResolveUDPAddr("udp", entry.endpoint.address)
+			if err == nil {
+				ln.udp, err = net.ListenUDP("udp", addr)
+			}
+		} else {
+			ln.tcp, err = net.Listen("tcp", entry.endpoint.address)
+		}
 		if err != nil {
 			for _, bound := range listeners {
 				bound.Close()
@@ -301,26 +330,38 @@ func runServer(entries []entryConfig, poolAddr string, whitelist map[string]bool
 	log.Printf("[server] waiting for agent connections on %s", poolLn.Addr())
 	for i, ln := range listeners {
 		log.Printf("[server] waiting for user connections on %s (entry %d: %s)", ln.Addr(), i+1, entries[i].endpoint.scheme)
+		if target := entries[i].endpoint.target; target != "" {
+			log.Printf("[server] forwarding entry %d: %s -> %s via agent", i+1, entries[i].endpoint.scheme, target)
+		}
 	}
 	pool := newConnPool()
 	go acceptPoolConns(poolLn, pool, whitelist, tlsConf)
 	go statusTicker(pool)
 	finished := make(chan error, len(listeners))
 	for i, ln := range listeners {
-		go func() { finished <- acceptUserConns(ln, pool, ppv2, entries[i].proxy) }()
+		go func() {
+			entry := entries[i]
+			if ln.udp != nil {
+				finished <- serveUDPForward(ln.udp, pool, entry.endpoint.target, entry.proxy)
+			} else {
+				finished <- acceptUserConns(ln.tcp, pool, ppv2, entry)
+			}
+		}()
 	}
 	return <-finished
 }
 
-func acceptUserConns(ln net.Listener, pool *connPool, ppv2 bool, proxy *proxyOptions) error {
+func acceptUserConns(ln net.Listener, pool *connPool, ppv2 bool, entry entryConfig) error {
 	for {
 		uc, err := ln.Accept()
 		if err != nil {
 			return fmt.Errorf("[server] client listener %s stopped: %w", ln.Addr(), err)
 		}
 		log.Printf("[server] user connected: %s via %s", uc.RemoteAddr(), ln.Addr())
-		if proxy != nil {
-			go serveProxyClient(uc, pool, proxy)
+		if entry.endpoint.target != "" {
+			go serveTCPForward(uc, pool, entry.endpoint.target, entry.proxy)
+		} else if entry.proxy != nil {
+			go serveProxyClient(uc, pool, entry.proxy)
 		} else {
 			go handleUserConn(uc, pool, ppv2)
 		}
@@ -433,7 +474,7 @@ func runAgent(serverAddr, targetAddr string, poolSize int, proto, psk string, pr
 	}
 
 	if proxy != nil {
-		log.Printf("[agent] server: %s, mode: SOCKS5 TCP/UDP + HTTP, idle pool: %d", serverAddr, poolSize)
+		log.Printf("[agent] server: %s, mode: SOCKS5 TCP/UDP + HTTP + fixed TCP/UDP forwarding, idle pool: %d", serverAddr, poolSize)
 	} else {
 		log.Printf("[agent] server: %s, target: %s, idle pool: %d", serverAddr, targetAddr, poolSize)
 	}

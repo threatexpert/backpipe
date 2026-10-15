@@ -1,6 +1,6 @@
 # backpipe
 
-backpipe 由 server 和 agent 组成。server 提供普通或加密的 SOCKS5/HTTP 代理服务；agent 部署在出口节点，主动连接 server 建立加密隧道，为 server 转发出站流量。server 的代理请求通过这些已有连接交给 agent 处理，因此从连接建立方向看，始终是 agent 主动连接 server。
+backpipe 由 server 和 agent 组成。server 提供普通或加密的 SOCKS5/HTTP 代理服务，也支持固定目标 TCP/UDP 端口转发；agent 部署在出口节点，主动连接 server 建立加密隧道，为 server 转发出站流量。server 的代理请求和端口转发通过这些已有连接交给 agent 处理，因此从连接建立方向看，始终是 agent 主动连接 server。
 
 ## 加密快速开始
 
@@ -109,13 +109,13 @@ backpipe agent -connect "tls://server_host:10086?psk=tunnel-key" -pool 20
 
 两个入口都支持 TCP 和 UDP。公网客户端连接 `socks5s://server_host:1080?psk=client-key`；本地应用连接 `127.0.0.1:3180`，使用普通 SOCKS5 或 HTTP 代理。本地入口省去客户端到 server 的加密开销，server 到 agent 的连接池仍然加密。
 
-每个入口可以独立配置监听地址、用户名、密码和 PSK，不同入口的凭据互不通用。所有入口共享同一个空闲池，`-pool 20` 表示总共维持 20 条空闲连接。关闭某个入口上的会话，不影响其他入口的会话。
+每个 SOCKS5 入口可以独立配置监听地址、用户名、密码和 PSK，不同入口的凭据互不通用。也可以同时添加 `tcp://地址?to=目标` 和 `udp://地址?to=目标` 固定转发入口，详见后文。所有这些入口共享同一个空闲池，`-pool 20` 表示总共维持 20 条空闲连接。关闭某个入口上的会话，不影响其他入口的会话。
 
 所有监听端口（包括 `-accept`）均绑定成功后才开始提供服务。任一端口绑定失败，server 会释放此前已绑定的端口，并报告失败的入口。日志显示入口地址和协议，不输出凭据。
 
-`-udp-timeout` 和 `-socks-server-ip` 是所有入口共用的 server 参数。默认 UDP 回复地址为 `0.0.0.0`，与 gonc 一致。兼容客户端会使用 TCP 控制连接的对端 IP，因此公网和本地客户端分别使用各自连接的入口地址。显式设置 `-socks-server-ip` 会覆盖**所有入口**的回复 IP，包括本地入口。
+`-udp-timeout` 是所有 UDP 会话共用的 server 参数。`-socks-server-ip` 仅影响 SOCKS5 入口：默认 UDP 回复地址为 `0.0.0.0`，与 gonc 一致。兼容客户端会使用 TCP 控制连接的对端 IP，因此公网和本地客户端分别使用各自连接的入口地址。显式设置 `-socks-server-ip` 会覆盖**所有 SOCKS5 入口**的回复 IP，包括本地入口，不影响固定 UDP 转发。
 
-多个 `tcp://` 入口也可以共享固定目标连接池。由于 agent 工作模式不同，同一个 server 不允许混用 `tcp://` 和 SOCKS5 入口。
+不带 `to` 的 `tcp://` 入口仍使用 agent `-target` 指定目标。多个这样的入口可以共享连接池，但不能与 SOCKS5 或带 `to` 的转发入口混用。
 
 ## 加密与认证
 
@@ -183,9 +183,42 @@ backpipe agent -connect "tls://server_host:10086?psk=@D:/keys/tunnel.key" -pool 
 
 URL 的第一个查询参数使用 `?psk=`，已有其他参数时使用 `&psk=`。日志和参数解析错误不输出 URL 中的凭据和 PSK。使用密钥文件也能避免把密钥明文放进进程命令行。
 
-## 固定目标 TCP 转发
+## 固定目标 TCP/UDP 端口转发
 
-server 使用 `tcp://` 入口，agent 指定目标地址：
+在 `-listen` 中通过 `to=host:port` 指定目标，每个入口可以使用不同目标，并与 SOCKS5/HTTP 入口共享连接池。客户端直接连接或发送原始 TCP/UDP 数据，无需使用代理协议：
+
+```sh
+backpipe server -listen "socks5s://:1080?psk=client-key" \
+  -listen "socks5://127.0.0.1:3180" \
+  -listen "udp://:500?to=charon:500" \
+  -listen "tcp://:8080?to=web:80" \
+  -accept "tls://:10086?psk=tunnel-key"
+
+backpipe agent -connect "tls://server_host:10086?psk=tunnel-key" -pool 20 \
+  -redirect "udp://charon:500=10.1.2.3:500" \
+  -redirect "tcp://web:80=10.1.2.3:80"
+```
+
+| server 入口 | 原目标 | agent 实际访问 |
+|-------------|--------|----------------|
+| UDP `:500` | `charon:500` | UDP `10.1.2.3:500` |
+| TCP `:8080` | `web:80` | TCP `10.1.2.3:80` |
+
+`to` 是**由 agent 访问的目标地址**。server 不解析该域名；agent 先匹配 `-redirect`，命中后访问替换地址，未命中时再按原目标解析、连接。`charon` 和 `web` 因此可以是没有 DNS 记录的逻辑名称，也可以直接使用真实域名或 IP。它们不是 agent 标识；多个 agent 加入同一个连接池时，会话使用池中任意可用连接，所有出口都应能处理这些目标。
+
+此模式下 agent **不指定 `-target`**。TCP 每个客户端连接占用一条池连接，支持双向转发和半关闭。UDP 按“监听入口＋客户端来源 IP、端口”维护会话：首包取用一条池连接，后续包复用；不同客户端及不同入口的会话互相隔离。每条池连接激活后，agent 自动补充空闲池。
+
+UDP 回包从 server 的原监听端口返回原客户端，例如上例始终通过 server 的 UDP 500 端口回复。agent 内部仍按实际回复来源封包，server 解包后只将原始 UDP 数据交给客户端，不需要给 `-redirect` 增加反向地址映射。目标服务看到的是 agent 的出口地址和自动分配的 UDP 源端口，不保留客户端源地址，也不保证源端口为 500。
+
+UDP 默认空闲 `2m` 后释放会话，双向流量都会延长存活时间；可在 server 和 agent 两端设置 `-udp-timeout 5m`。超时或隧道断开后，下一包重新取用池连接，agent 的 UDP 源端口可能变化。每个固定 UDP 入口最多维持 1024 个会话，其中等待 agent 就绪的会话最多 128 个；每会话最多排队 16 个数据报，入口总排队载荷最多 8 MiB。等待 agent 超时或超过这些容量时会丢包。UDP 数据仍封装在连接池的 TCP/TLS 连接中，TCP 重传可能延迟同一会话的后续数据报。
+
+固定转发入口 `tcp://`、`udp://` 本身不提供 TLS+PSK 或代理用户名认证；`-accept/-connect tls://...` 加密的是 server 与 agent 之间的连接。客户端到 server 的加密取决于应用协议自身。固定 UDP 入口只需开放配置的 UDP 监听端口，例如 UDP/500；连接池另需开放 TCP/10086，不使用 SOCKS5 动态分配的 UDP 端口。
+
+`udp://` 必须指定 `to`；`to` 只能用于 TCP/UDP 监听入口，且只能出现一次。目标格式为 `host:port`，端口范围为 1～65535；IPv6 使用方括号，例如 `-listen "tcp://:8080?to=[2001:db8::1]:80"`。每个入口只有一个固定目标，需要多个规则时重复指定 `-listen`。
+
+### agent 指定目标的 TCP 转发
+
+也可以使用不带 `to` 的 `tcp://` 入口，由 agent `-target` 指定统一目标：
 
 ```sh
 backpipe server -listen tcp://:8080 -accept :10086
@@ -194,7 +227,7 @@ backpipe agent -connect server_host:10086 -target 127.0.0.1:80 -pool 20
 
 连接池同样支持 `tls://host:port?psk=key`。`-target` 接受 `host:port` 或 `tcp://host:port`。目标服务支持 PROXY v2 时，可在 server 添加 `-ppv2`，向目标发送包含客户端地址的 PROXY v2 头。
 
-两端模式必须匹配：SOCKS5 入口对应**不带** `-target` 的 agent；TCP 入口对应**带** `-target` 的 agent。需要同时使用两种模式时，请分别运行 server 进程并使用不同的连接池端口。
+两端模式必须匹配：SOCKS5 入口和带 `to` 的 TCP/UDP 入口对应**不带** `-target` 的 agent；不带 `to` 的 TCP 入口对应**带** `-target` 的 agent。两种模式不能共享连接池；需要同时使用时，请分别运行 server 进程并使用不同的连接池端口。`-ppv2` 仅用于这种不带 `to` 的 TCP 模式。
 
 ## agent 出站目标重定向
 
@@ -211,7 +244,7 @@ backpipe agent -connect "tls://server_host:10086?psk=@tunnel.key" -pool 20 \
 
 规则精确匹配协议、主机和端口，支持 IP 和 ASCII 域名（国际化域名请使用 Punycode），不支持通配符、正则或网段。域名匹配忽略大小写和末尾的一个点，IP 按标准形式比较。匹配发生在 DNS 解析之前，因此原域名没有 DNS 记录也可以重定向；但如果客户端已经将域名解析成 IP，域名规则不会命中，应改用 IP 规则或让客户端将域名交给代理。
 
-重定向适用于 SOCKS5 TCP、HTTP CONNECT、普通 HTTP、SOCKS5 UDP，以及固定目标模式的 `-target`。仅改变实际连接或发送的目标，不修改 HTTP Host、TLS SNI 或应用数据，也不影响 agent 的 `-connect` 连接池地址。
+重定向适用于 SOCKS5 TCP、HTTP CONNECT、普通 HTTP、SOCKS5 UDP、`-listen` 的 TCP/UDP `to` 目标，以及 agent 的 `-target`。仅改变实际连接或发送的目标，不修改 HTTP Host、TLS SNI 或应用数据，也不影响 agent 的 `-connect` 连接池地址。
 
 - 未命中规则时，仍访问原目标。
 - 命中后只改写一次，不继续用新目标匹配下一条规则。
@@ -232,12 +265,14 @@ UDP 会缓存会话内已解析的目标，命中缓存时不重复打印重定�
 
 ## UDP 行为与公网部署
 
+以下说明针对 SOCKS5 UDP 代理。固定 UDP 入口的会话和回包行为见“固定目标 TCP/UDP 端口转发”。
+
 - 每个 UDP ASSOCIATE 占用一条池连接，并在 **server** 上分配一个临时 UDP 端口；一个会话可以访问多个目标。
 - 默认向客户端回复 `0.0.0.0` 和实际分配的端口；显式指定 `-socks-server-ip` 时使用配置 IP。实际 socket 仍绑定在 TCP 控制连接的本机 IP 上。
 - 客户端 UDP 包通过 server-agent 的 TCP/TLS 连接封装转发，再由 agent 以 UDP 发往目标。TCP 重传可能延迟同一会话中的后续数据报。
 - SOCKS TCP 控制连接必须保持打开。控制连接关闭、隧道断开或空闲超时，都会结束 UDP 会话并关闭相关 socket。
 - 默认空闲超时为 `2m`。修改时可在两端都设置 `-udp-timeout 5m`；两端不一致时，较短的超时会先触发。
-- 防火墙和安全组需要允许访问动态分配的 UDP 端口，仅开放 UDP/1080 不够。目前不支持固定或共享 UDP 端口，也不支持配置分配端口范围。
+- 防火墙和安全组需要允许访问动态分配的 UDP 端口，仅开放 UDP/1080 不够。SOCKS5 UDP 代理目前不支持固定或共享 UDP 端口，也不支持配置分配端口范围；固定目标转发可使用 `-listen "udp://:端口?to=目标:端口"`。
 - server 位于 NAT 后时，支持 `0.0.0.0` 回退的客户端会使用所连接的代理 IP。需要明确指定回复地址时，可设置 `-socks-server-ip 公网IP`。NAT 仍需将分配的 UDP 端口按同号映射到 server，此参数不会自动创建映射。
 - UDP 来源 IP 必须与 TCP 控制连接的对端 IP 一致；首个有效数据包确定实际来源端口。不会拿 UDP ASSOCIATE 请求里的地址和端口过滤数据，兼容 gonc 及 NAT 后的客户端。不支持分片 SOCKS5 UDP 数据报。
 
@@ -256,16 +291,16 @@ UDP 会缓存会话内已解析的目标，命中缓存时不重复打印重定�
 
 | 参数 | 角色 | 默认值与用途 |
 |------|------|--------------|
-| `-listen` | server | 必填，可重复；客户端入口，支持 `tcp://`、`socks5://`、`socks5s://` |
+| `-listen` | server | 必填，可重复；代理入口 `socks5://`、`socks5s://`；固定转发 `tcp://地址?to=目标`、`udp://地址?to=目标`；裸 `tcp://` 配合 agent `-target` |
 | `-accept` | server | 必填；agent 连接池监听地址，支持裸地址、`tcp://`、`tls://` |
 | `-connect` | agent | 必填；server 连接池地址，支持裸地址、`tcp://`、`tls://` |
-| `-target` | agent | 省略时作为代理出口；指定时进行固定目标 TCP 转发 |
+| `-target` | agent | 省略时处理代理和带 `to` 的 TCP/UDP 转发；指定时仅配合不带 `to` 的 TCP 入口 |
 | `-pool` | agent | `5`；要维持的空闲连接数 |
 | `-redirect` | agent | 可重复；`[tcp://\|udp://]host:port=host:port`，默认同时匹配 TCP/UDP |
 | `-allow` | server | agent IP 白名单，以逗号分隔；留空时不限制 agent IP |
-| `-ppv2` | server | `false`；发送 PROXY v2 头，仅支持 TCP 入口 |
-| `-socks-server-ip` | server | UDP 回复 IP；默认 `0.0.0.0`，由兼容客户端使用 TCP 对端 IP |
-| `-udp-timeout` | 两端 | `2m`；代理模式下的 UDP 空闲超时 |
+| `-ppv2` | server | `false`；发送 PROXY v2 头，仅支持不带 `to` 的 TCP 入口 |
+| `-socks-server-ip` | server | SOCKS5 UDP 回复 IP；默认 `0.0.0.0`，由兼容客户端使用 TCP 对端 IP，不影响固定 UDP 入口 |
+| `-udp-timeout` | 两端 | `2m`；SOCKS5 UDP 和固定 UDP 转发的空闲超时 |
 | `-version` | 全局 | 输出版本并退出 |
 
 当前命令行已替代旧的 `-mode/-left/-right/-socks5/-proto/-psk/-socks-auth/-left-ppv2` 参数，不兼容旧命令，也不再接受 agent 侧的 `:s5s` 目标。请通过 server 的 `-listen` 配置代理入口。

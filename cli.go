@@ -25,6 +25,9 @@ Usage:
 
   backpipe server -listen "socks5s://:1080?psk=client-key" -listen socks5://127.0.0.1:3180 -accept :10086
 
+  backpipe server -listen "udp://:500?to=charon:500" -listen "tcp://:8080?to=web:80" -listen socks5://:1080 -accept :10086
+  backpipe agent -connect server_host:10086 -pool 20 -redirect "udp://charon:500=10.1.2.3:500"
+
   backpipe server -listen tcp://:8080 -accept :10086
   backpipe agent -connect server_host:10086 -target 127.0.0.1:80
 
@@ -33,7 +36,7 @@ Use backpipe -version for the version. Old -mode/-left/-right syntax is removed.
 `
 
 type endpoint struct {
-	scheme, address, username, password, psk string
+	scheme, address, username, password, psk, target string
 }
 
 // Never return URL parser errors: they can contain credentials or the PSK.
@@ -47,7 +50,7 @@ func parseEndpoint(value, option string) (endpoint, error) {
 	}
 	if !strings.Contains(value, "://") {
 		if option == "listen" {
-			return fail("use tcp://, socks5:// or socks5s://")
+			return fail("use tcp://, udp://, socks5:// or socks5s://")
 		}
 		value = "tcp://" + value
 	}
@@ -59,7 +62,7 @@ func parseEndpoint(value, option string) (endpoint, error) {
 	allowed := ep.scheme == "tcp"
 	switch option {
 	case "listen":
-		allowed = allowed || ep.scheme == "socks5" || ep.scheme == "socks5s"
+		allowed = allowed || ep.scheme == "udp" || ep.scheme == "socks5" || ep.scheme == "socks5s"
 	case "accept", "connect":
 		allowed = allowed || ep.scheme == "tls"
 	case "target":
@@ -93,9 +96,28 @@ func parseEndpoint(value, option string) (endpoint, error) {
 	}
 	encrypted := ep.scheme == "tls" || ep.scheme == "socks5s"
 	for key, values := range query {
-		if key != "psk" || len(values) != 1 || !encrypted {
-			return fail("only one psk query parameter is allowed, and only for TLS")
+		if len(values) != 1 {
+			return fail("query parameters must not be repeated")
 		}
+		switch key {
+		case "psk":
+			if !encrypted {
+				return fail("psk is only supported for TLS")
+			}
+		case "to":
+			if option != "listen" || (ep.scheme != "tcp" && ep.scheme != "udp") {
+				return fail("to is only supported on TCP/UDP listeners")
+			}
+			ep.target, err = normalizeRedirectAddress(values[0])
+			if err != nil {
+				return fail("invalid to target: " + err.Error())
+			}
+		default:
+			return fail("unsupported query parameter")
+		}
+	}
+	if ep.scheme == "udp" && ep.target == "" {
+		return fail("UDP listeners require to=host:port")
 	}
 	if encrypted {
 		ep.psk, err = secure.ReadPSKFile(query.Get("psk"))
@@ -139,24 +161,24 @@ func parseCommand(role string, args []string, output io.Writer) (*commandConfig,
 	var accept, connect, target, serverIP string
 	var idle time.Duration
 	if role == "server" {
-		fs.Func("listen", "client entry (repeatable; SOCKS5 entries also accept HTTP): tcp://addr, socks5://[user:pass@]addr, socks5s://[user:pass@]addr?psk=key", func(value string) error {
+		fs.Func("listen", "client entry (repeatable): tcp://addr?to=host:port, udp://addr?to=host:port, socks5://[user:pass@]addr, socks5s://[user:pass@]addr?psk=key; SOCKS5 also accepts HTTP; bare tcp://addr requires agent -target", func(value string) error {
 			listens = append(listens, value)
 			return nil
 		})
 		fs.StringVar(&accept, "accept", "", "agent pool listener: host:port or tls://host:port?psk=key")
 		fs.StringVar(&c.allow, "allow", "", "comma-separated agent IP whitelist")
 		fs.StringVar(&serverIP, "socks-server-ip", "", "advertised UDP relay IP (default: 0.0.0.0; clients use the TCP peer IP)")
-		fs.BoolVar(&c.ppv2, "ppv2", false, "inject PROXY v2 header (tcp listener only)")
+		fs.BoolVar(&c.ppv2, "ppv2", false, "inject PROXY v2 header (bare tcp:// listener with agent -target only)")
 	} else {
 		fs.StringVar(&connect, "connect", "", "server pool address: host:port or tls://host:port?psk=key")
-		fs.StringVar(&target, "target", "", "fixed TCP target host:port; omit for SOCKS5 TCP/UDP and HTTP proxy exit")
+		fs.StringVar(&target, "target", "", "fixed TCP target for bare tcp:// listeners; omit for SOCKS5/HTTP and listeners with ?to=host:port")
 		fs.IntVar(&c.pool, "pool", 5, "desired idle connections; active sessions are additional")
 		fs.Func("redirect", "outbound target rewrite (repeatable): [tcp://|udp://]host:port=host:port; no protocol matches both", func(value string) error {
 			redirects = append(redirects, value)
 			return nil
 		})
 	}
-	fs.DurationVar(&idle, "udp-timeout", 2*time.Minute, "SOCKS5 UDP idle timeout; set on both peers")
+	fs.DurationVar(&idle, "udp-timeout", 2*time.Minute, "UDP idle timeout for SOCKS5 and fixed forwarding; set on both peers")
 	fs.Usage = func() {
 		fmt.Fprintf(output, "backpipe %s options:\n", role)
 		fs.SetOutput(output)
@@ -178,6 +200,7 @@ func parseCommand(role string, args []string, output io.Writer) (*commandConfig,
 		return nil, err
 	}
 	proxyMode := false
+	hasSOCKS := false
 	if role == "server" {
 		if len(listens) == 0 {
 			return nil, fmt.Errorf("at least one -listen is required")
@@ -187,20 +210,21 @@ func parseCommand(role string, args []string, output io.Writer) (*commandConfig,
 			if err != nil {
 				return nil, fmt.Errorf("entry %d: %w", i+1, err)
 			}
-			isProxy := ep.scheme != "tcp"
+			isProxy := ep.scheme != "tcp" || ep.target != ""
 			if i > 0 && isProxy != proxyMode {
-				return nil, fmt.Errorf("tcp:// and SOCKS5 listeners cannot share a pool; use separate server processes")
+				return nil, fmt.Errorf("bare tcp:// listeners require agent -target and cannot share a pool with SOCKS5 or listeners using to; use separate server processes")
 			}
 			proxyMode = isProxy
+			hasSOCKS = hasSOCKS || ep.scheme == "socks5" || ep.scheme == "socks5s"
 			c.entries = append(c.entries, entryConfig{endpoint: ep})
 		}
 		if c.tunnel, err = parseEndpoint(accept, "accept"); err != nil {
 			return nil, err
 		}
 		if proxyMode && c.ppv2 {
-			return nil, fmt.Errorf("-ppv2 requires a tcp:// listener")
+			return nil, fmt.Errorf("-ppv2 requires a bare tcp:// listener with agent -target")
 		}
-		if !proxyMode && serverIP != "" {
+		if !hasSOCKS && serverIP != "" {
 			return nil, fmt.Errorf("-socks-server-ip requires a SOCKS5 listener")
 		}
 	} else {
@@ -228,7 +252,7 @@ func parseCommand(role string, args []string, output io.Writer) (*commandConfig,
 			}
 		})
 		if specified {
-			return nil, fmt.Errorf("-udp-timeout requires SOCKS5 mode")
+			return nil, fmt.Errorf("-udp-timeout requires SOCKS5 or listeners using to; omit agent -target")
 		}
 	} else if role == "agent" {
 		c.proxy, err = newProxyOptions("", idle)
@@ -238,7 +262,11 @@ func parseCommand(role string, args []string, output io.Writer) (*commandConfig,
 	} else {
 		for i := range c.entries {
 			entry := &c.entries[i]
-			entry.proxy, err = newProxyOptions(serverIP, idle)
+			advertisedIP := ""
+			if entry.endpoint.scheme == "socks5" || entry.endpoint.scheme == "socks5s" {
+				advertisedIP = serverIP
+			}
+			entry.proxy, err = newProxyOptions(advertisedIP, idle)
 			if err != nil {
 				return nil, err
 			}

@@ -15,8 +15,6 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
-
-	"github.com/threatexpert/gonc/v2/netx"
 )
 
 const maxHTTPHeader = 64 << 10
@@ -149,21 +147,6 @@ func stripHTTPHopHeaders(h http.Header) {
 	}
 }
 
-func openHTTPTunnel(tunnel net.Conn, target string) error {
-	tunnel.SetDeadline(time.Now().Add(30 * time.Second))
-	if err := writeAll(tunnel, []byte("tcp://"+target+"\n")); err != nil {
-		return err
-	}
-	response, err := netx.ReadString(tunnel, '\n', 1024)
-	if err != nil {
-		return err
-	}
-	if strings.TrimSpace(response) != "OK" {
-		return fmt.Errorf("agent could not connect")
-	}
-	return tunnel.SetDeadline(time.Time{})
-}
-
 func serveHTTPProxy(client net.Conn, reader *bufio.Reader, pool *connPool, options *proxyOptions) {
 	req, replay, code := readProxyHTTPRequest(reader)
 	if code != 0 {
@@ -195,7 +178,7 @@ func serveHTTPProxy(client net.Conn, reader *bufio.Reader, pool *connPool, optio
 	defer tunnel.Close()
 	atomic.AddInt64(&relayCount, 1)
 	defer atomic.AddInt64(&relayCount, -1)
-	if err := openHTTPTunnel(tunnel, target); err != nil {
+	if err := openTCPTunnel(tunnel, target); err != nil {
 		httpProxyError(client, http.StatusBadGateway)
 		return
 	}

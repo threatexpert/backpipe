@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestEndpointCredentialsAndKeyFiles(t *testing.T) {
@@ -94,5 +95,82 @@ func TestCLIHelpAndErrorsDoNotExposeSecrets(t *testing.T) {
 	}
 	if err := runCLI([]string{"-version"}, io.Discard); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestFixedTargetListenersShareRoutedMode(t *testing.T) {
+	c, err := parseCommand("server", []string{
+		"-listen", "udp://:500?to=Charon.:00500",
+		"-listen", "tcp://127.0.0.1:8080?to=%5B2001:db8::1%5D:80",
+		"-listen", "socks5://user:pass@127.0.0.1:3180",
+		"-listen", "socks5s://:1080?psk=client-key",
+		"-accept", "tls://:10086?psk=pool-key",
+		"-socks-server-ip", "192.0.2.1",
+		"-udp-timeout", "5m",
+	}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.entries) != 4 || c.entries[0].endpoint.target != "charon:500" || c.entries[1].endpoint.target != "[2001:db8::1]:80" {
+		t.Fatalf("fixed targets not parsed: %+v", c.entries)
+	}
+	for i, entry := range c.entries {
+		if entry.proxy == nil || entry.proxy.udpTimeout != 5*time.Minute {
+			t.Fatalf("entry %d not configured for shared routed mode", i)
+		}
+		wantServerIP := ""
+		if i >= 2 {
+			wantServerIP = "192.0.2.1"
+		}
+		if entry.proxy.config.ServerIP != wantServerIP {
+			t.Fatalf("entry %d got SOCKS relay IP %q, want %q", i, entry.proxy.config.ServerIP, wantServerIP)
+		}
+		if (entry.proxy.entryTLS != nil) != (i == 3) {
+			t.Fatalf("entry %d has incorrect entry encryption", i)
+		}
+	}
+	for _, listen := range []string{"udp://:500?to=charon:500", "tcp://:8080?to=web:80"} {
+		c, err := parseCommand("server", []string{"-listen", listen, "-accept", ":10086"}, io.Discard)
+		if err != nil || c.entries[0].proxy == nil {
+			t.Fatalf("standalone fixed listener %q: %v", listen, err)
+		}
+	}
+	c, err = parseCommand("server", []string{"-listen", "tcp://:8080", "-listen", "tcp://:8081", "-accept", ":10086", "-ppv2"}, io.Discard)
+	if err != nil || c.entries[0].proxy != nil || c.entries[1].proxy != nil || !c.ppv2 {
+		t.Fatalf("bare TCP mode changed: %v", err)
+	}
+}
+
+func TestRejectInvalidFixedTargetListeners(t *testing.T) {
+	for _, value := range []string{
+		"udp://:500", "udp://:500?to=", "tcp://:8080?to=", "udp://:500?to=:500",
+		"udp://:500?to=charon:0", "udp://:500?to=charon:65536", "tcp://:8080?to=web:abc",
+		"udp://:500?to=charon:500&to=charon:501", "tcp://:8080?to=tcp://web:80",
+		"udp://:500?to=charon:500&psk=key", "tcp://:8080?to=web:80&unknown=value",
+		"socks5://:1080?to=web:80", "socks5s://:1080?psk=key&to=web:80",
+		"udp://user:pass@:500?to=charon:500", "udp://:500?to=charon:500%0Atcp://other:80",
+	} {
+		t.Run(value, func(t *testing.T) {
+			if _, err := parseEndpoint(value, "listen"); err == nil {
+				t.Fatal("invalid fixed-target listener accepted")
+			}
+		})
+	}
+	for _, option := range []string{"accept", "connect", "target"} {
+		if _, err := parseEndpoint("tcp://127.0.0.1:10086?to=web:80", option); err == nil {
+			t.Fatalf("to accepted on -%s", option)
+		}
+	}
+	for _, args := range [][]string{
+		{"-listen", "tcp://:8080", "-listen", "udp://:500?to=charon:500", "-accept", ":10086"},
+		{"-listen", "tcp://:8080?to=web:80", "-listen", "tcp://:8081", "-accept", ":10086"},
+		{"-listen", "tcp://:8080?to=web:80", "-accept", ":10086", "-ppv2"},
+		{"-listen", "udp://:500?to=charon:500", "-accept", ":10086", "-ppv2"},
+		{"-listen", "udp://:500?to=charon:500", "-accept", ":10086", "-socks-server-ip", "127.0.0.1"},
+		{"-listen", "tcp://:8080?to=web:80", "-accept", ":10086", "-socks-server-ip", "127.0.0.1"},
+	} {
+		if _, err := parseCommand("server", args, io.Discard); err == nil {
+			t.Fatalf("invalid fixed listener mode accepted: %v", args)
+		}
 	}
 }

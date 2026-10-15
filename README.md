@@ -4,27 +4,42 @@ backpipe 由 server 和 agent 组成。server 提供普通或加密的 SOCKS5/HT
 
 ## 加密快速开始
 
-在 server 上同时开启公网加密入口、本地普通入口和加密连接池入口：
+在 server 上同时开启公网加密代理、本地普通代理、UDP 500/4500 和 TCP 8080 端口转发，所有入口共享加密连接池：
 
 ```sh
-backpipe server -listen "socks5s://:1080?psk=client-key" -listen "socks5://127.0.0.1:3180" -accept "tls://:10086?psk=tunnel-key"
+backpipe server -listen "socks5s://:1080?psk=client-key" \
+  -listen "socks5://127.0.0.1:3180" \
+  -listen "udp://:500?to=charon:500" \
+  -listen "udp://:4500?to=charon:4500" \
+  -listen "tcp://:8080?to=web:80" \
+  -accept "tls://:10086?psk=tunnel-key"
 ```
 
-在 agent 上主动连接 server，维持 20 条空闲加密连接：
+在 agent 上主动连接 server，维持 20 条空闲加密连接，并将转发目标重定向到实际服务地址：
 
 ```sh
-backpipe agent -connect "tls://server_host:10086?psk=tunnel-key" -pool 20
+backpipe agent -connect "tls://server_host:10086?psk=tunnel-key" -pool 20 \
+  -redirect "udp://charon:500=10.1.2.3:500" \
+  -redirect "udp://charon:4500=10.1.2.3:4500" \
+  -redirect "tcp://web:80=10.1.2.3:80"
 ```
 
 将 `server_host` 替换为 server 的地址，`client-key` 和 `tunnel-key` 替换为实际密钥；agent 与 server 的连接池密钥必须一致。
+
+将 `10.1.2.3` 替换为 agent 本机或其可访问的目标服务 IP，各条规则可以使用不同 IP。`charon` 和 `web` 是用于匹配重定向规则的逻辑名称，无需配置 DNS。仅使用代理时，省略三个固定转发 `-listen` 和对应的 `-redirect` 即可。
 
 | 地址 | 用途 |
 |------|------|
 | `server_host:1080` | 公网加密代理入口，客户端使用 gonc 兼容的 TLS+PSK 协议，密钥为 `client-key` |
 | `127.0.0.1:3180` | server 本机应用使用的普通 SOCKS5/HTTP 入口，省去本地接入的加密开销 |
+| `server_host:500/UDP` | 经 agent 转发到 `10.1.2.3:500/UDP` |
+| `server_host:4500/UDP` | 经 agent 转发到 `10.1.2.3:4500/UDP` |
+| `server_host:8080/TCP` | 经 agent 转发到 `10.1.2.3:80/TCP` |
 | `server_host:10086` | agent 主动连接的加密连接池入口，密钥为 `tunnel-key` |
 
-两个代理入口共享连接池，均支持 SOCKS5 TCP/UDP 和 HTTP。server 到 agent 的业务请求通过加密池连接传输。公网使用 UDP 时，还需允许访问 server 动态分配的 UDP 端口，详见后面的“UDP 行为与公网部署”。
+两个代理入口均支持 SOCKS5 TCP/UDP 和 HTTP，与固定转发入口共用这 20 条空闲连接，使用后自动补池。所有入口的 server-agent 流量均通过加密池连接传输；固定 TCP/UDP 入口不要求客户端使用代理协议，其客户端到 server 的加密由应用协议自身提供。
+
+防火墙按需开放 TCP 1080、8080、10086 和 UDP 500、4500。公网使用 SOCKS5 UDP 代理时，还需允许访问 server 动态分配的 UDP 端口，详见后面的“UDP 行为与公网部署”；固定 UDP 转发只使用配置的监听端口。
 
 ## 工作原理
 

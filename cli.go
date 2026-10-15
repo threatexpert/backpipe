@@ -122,6 +122,7 @@ type commandConfig struct {
 	allow          string
 	ppv2           bool
 	proxy          *proxyOptions
+	redirects      redirectRules
 }
 
 func parseCommand(role string, args []string, output io.Writer) (*commandConfig, error) {
@@ -134,6 +135,7 @@ func parseCommand(role string, args []string, output io.Writer) (*commandConfig,
 	// malformed URLs and misplaced options cannot expose keys in diagnostics.
 	fs.SetOutput(io.Discard)
 	var listens []string
+	var redirects []string
 	var accept, connect, target, serverIP string
 	var idle time.Duration
 	if role == "server" {
@@ -149,6 +151,10 @@ func parseCommand(role string, args []string, output io.Writer) (*commandConfig,
 		fs.StringVar(&connect, "connect", "", "server pool address: host:port or tls://host:port?psk=key")
 		fs.StringVar(&target, "target", "", "fixed TCP target host:port; omit for SOCKS5 TCP/UDP and HTTP proxy exit")
 		fs.IntVar(&c.pool, "pool", 5, "desired idle connections; active sessions are additional")
+		fs.Func("redirect", "outbound target rewrite (repeatable): [tcp://|udp://]host:port=host:port; no protocol matches both", func(value string) error {
+			redirects = append(redirects, value)
+			return nil
+		})
 	}
 	fs.DurationVar(&idle, "udp-timeout", 2*time.Minute, "SOCKS5 UDP idle timeout; set on both peers")
 	fs.Usage = func() {
@@ -168,6 +174,9 @@ func parseCommand(role string, args []string, output io.Writer) (*commandConfig,
 		return nil, fmt.Errorf("unexpected positional arguments; use backpipe %s -help", role)
 	}
 	var err error
+	if c.redirects, err = parseRedirectRules(redirects); err != nil {
+		return nil, err
+	}
 	proxyMode := false
 	if role == "server" {
 		if len(listens) == 0 {
@@ -268,7 +277,7 @@ func runCLI(args []string, output io.Writer) error {
 	if c.role == "server" {
 		return runServer(c.entries, c.tunnel.address, parseWhitelist(c.allow), proto, c.tunnel.psk, c.ppv2)
 	} else {
-		runAgent(c.tunnel.address, c.target.address, c.pool, proto, c.tunnel.psk, c.proxy)
+		runAgent(c.tunnel.address, c.target.address, c.pool, proto, c.tunnel.psk, c.proxy, c.redirects)
 	}
 	return nil
 }

@@ -196,6 +196,40 @@ backpipe agent -connect server_host:10086 -target 127.0.0.1:80 -pool 20
 
 两端模式必须匹配：SOCKS5 入口对应**不带** `-target` 的 agent；TCP 入口对应**带** `-target` 的 agent。需要同时使用两种模式时，请分别运行 server 进程并使用不同的连接池端口。
 
+## agent 出站目标重定向
+
+在 agent 上重复指定 `-redirect`，可以在连接目标前改写目标地址和端口。server 和客户端无需修改配置，连接池协议也不变。
+
+```sh
+backpipe agent -connect "tls://server_host:10086?psk=@tunnel.key" -pool 20 \
+  -redirect "priv-domain:500=1.2.3.4:600" \
+  -redirect "tcp://web.internal:443=10.0.0.8:8443" \
+  -redirect "udp://dns.internal:53=10.0.0.53:5353"
+```
+
+规则格式为 `[tcp://|udp://]原主机:原端口=新主机:新端口`。协议前缀写在等号左侧，右侧只写 `host:port`；不写协议时同时匹配 TCP 和 UDP。重定向不会把 TCP 转换成 UDP，或反过来。IPv6 地址使用方括号，例如 `-redirect "[2001:db8::1]:500=[2001:db8::2]:600"`。
+
+规则精确匹配协议、主机和端口，支持 IP 和 ASCII 域名（国际化域名请使用 Punycode），不支持通配符、正则或网段。域名匹配忽略大小写和末尾的一个点，IP 按标准形式比较。匹配发生在 DNS 解析之前，因此原域名没有 DNS 记录也可以重定向；但如果客户端已经将域名解析成 IP，域名规则不会命中，应改用 IP 规则或让客户端将域名交给代理。
+
+重定向适用于 SOCKS5 TCP、HTTP CONNECT、普通 HTTP、SOCKS5 UDP，以及固定目标模式的 `-target`。仅改变实际连接或发送的目标，不修改 HTTP Host、TLS SNI 或应用数据，也不影响 agent 的 `-connect` 连接池地址。
+
+- 未命中规则时，仍访问原目标。
+- 命中后只改写一次，不继续用新目标匹配下一条规则。
+- 同一协议和原目标不能重复配置；不带协议的规则与相同目标的单协议规则也不能重叠。冲突在启动时报错。
+- 实际目标连接或解析失败时，不回退到原目标。
+- 规则在 agent 启动时读取；修改参数后需要重启 agent。
+
+**UDP 只改发送目标，不改回复来源。** 例如 `priv-domain:500=1.2.3.4:600`，agent 向 `1.2.3.4:600` 发包，收到它的回复后，SOCKS5 UDP 回复头仍填写实际来源 `1.2.3.4:600`，不会恢复成 `priv-domain:500`。如果客户端要求回复来源必须匹配原目标，可能丢弃该回复。不同原目标映射到同一实际地址时，也不会根据来源地址反向区分原目标。
+
+规则命中时会输出日志：
+
+```text
+[agent] redirect tcp: priv-domain:500 -> 1.2.3.4:600
+[agent] redirect udp: priv-domain:500 -> 1.2.3.4:600
+```
+
+UDP 会缓存会话内已解析的目标，命中缓存时不重复打印重定向日志。
+
 ## UDP 行为与公网部署
 
 - 每个 UDP ASSOCIATE 占用一条池连接，并在 **server** 上分配一个临时 UDP 端口；一个会话可以访问多个目标。
@@ -227,6 +261,7 @@ backpipe agent -connect server_host:10086 -target 127.0.0.1:80 -pool 20
 | `-connect` | agent | 必填；server 连接池地址，支持裸地址、`tcp://`、`tls://` |
 | `-target` | agent | 省略时作为代理出口；指定时进行固定目标 TCP 转发 |
 | `-pool` | agent | `5`；要维持的空闲连接数 |
+| `-redirect` | agent | 可重复；`[tcp://\|udp://]host:port=host:port`，默认同时匹配 TCP/UDP |
 | `-allow` | server | agent IP 白名单，以逗号分隔；留空时不限制 agent IP |
 | `-ppv2` | server | `false`；发送 PROXY v2 头，仅支持 TCP 入口 |
 | `-socks-server-ip` | server | UDP 回复 IP；默认 `0.0.0.0`，由兼容客户端使用 TCP 对端 IP |
@@ -249,7 +284,7 @@ Windows 下可运行 `build.bat` 构建 Windows 和 Linux amd64 程序，产物�
 
 gonc 依赖固定到提交 `41d3f96c03fec9fbcf7ed9524b61792fca61ebee`，对应伪版本 `v2.6.11-0.20261013082942-41d3f96c03fe`。不使用本地 `replace`，也无需额外发布 gonc 版本。
 
-测试覆盖真实 server/agent 进程、普通和加密多入口共享连接池、端口绑定失败回滚、gonc TCP/UDP 及 HTTP CONNECT 兼容、HTTP GET/POST 和 HTTPS 转发、PSK 拒绝、TLS 版本与套件协商、每会话 UDP 加密、SOCKS 认证、半关闭、空闲清理、断线重连、自动补池和固定目标转发。
+测试覆盖真实 server/agent 进程、普通和加密多入口共享连接池、端口绑定失败回滚、gonc TCP/UDP 及 HTTP CONNECT 兼容、HTTP GET/POST 和 HTTPS 转发、PSK 拒绝、TLS 版本与套件协商、每会话 UDP 加密、SOCKS 认证、半关闭、空闲清理、断线重连、自动补池、固定目标转发，以及出站重定向、HTTP Host 保留和 UDP 实际回复来源。
 
 TCP 转发使用 gonc 导出的隧道处理接口。UDP 帧格式与 gonc 兼容，会话清理由 backpipe 自行管理，以避开所固定依赖版本中的等待组和共享地址问题。
 

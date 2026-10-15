@@ -102,7 +102,7 @@ func TestUDPTunnelPartialFrameTimesOutAndReturns(t *testing.T) {
 	defer s.Close()
 	defer peer.Close()
 	done := make(chan struct{})
-	go func() { serveUDPTunnel(s, 100*time.Millisecond); close(done) }()
+	go func() { serveUDPTunnel(s, 100*time.Millisecond, nil); close(done) }()
 	peer.SetDeadline(time.Now().Add(2 * time.Second))
 	expectBytes(t, peer, []byte("OK\n"))
 	peer.Write([]byte{0}) // Half a frame header; the other byte never arrives.

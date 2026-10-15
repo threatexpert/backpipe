@@ -192,7 +192,7 @@ func serveUDPAssociation(client, tunnel net.Conn, options *proxyOptions, key [32
 	log.Printf("[server] UDP association ended: %s (sent=%d received=%d packets)", peer, sent, received)
 }
 
-func serveUDPTunnel(tunnel net.Conn, idle time.Duration) {
+func serveUDPTunnel(tunnel net.Conn, idle time.Duration, redirects redirectRules) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	udp, err := net.ListenUDP("udp", nil)
@@ -231,6 +231,12 @@ func serveUDPTunnel(tunnel net.Conn, idle time.Duration) {
 			key := net.JoinHostPort(host, strconv.Itoa(port))
 			dst := cache[key]
 			if dst == nil {
+				if target := redirects.rewrite("udp", key); target != key {
+					// Parsed rules guarantee a valid host and numeric port.
+					var targetPort string
+					host, targetPort, _ = net.SplitHostPort(target)
+					port, _ = strconv.Atoi(targetPort)
+				}
 				dst, err = resolveUDPTarget(ctx, host, port)
 				if err != nil {
 					continue

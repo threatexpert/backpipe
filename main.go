@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-const Version = "v1.1.0"
+const Version = "v1.2.0"
 
 func main() {
 	if err := runCLI(os.Args[1:], os.Stdout); err != nil {
@@ -421,7 +421,7 @@ func nextAgentConnID() uint64 {
 	return agentConnID
 }
 
-func runAgent(serverAddr, targetAddr string, poolSize int, proto, psk string, proxy *proxyOptions) {
+func runAgent(serverAddr, targetAddr string, poolSize int, proto, psk string, proxy *proxyOptions, redirects redirectRules) {
 	var tlsConf *tlsPSKConfig
 	if proto == "tls" {
 		var err error
@@ -447,11 +447,11 @@ func runAgent(serverAddr, targetAddr string, poolSize int, proto, psk string, pr
 	}
 
 	for range spawn {
-		go agentWorker(serverAddr, targetAddr, spawn, tlsConf, proxy)
+		go agentWorker(serverAddr, targetAddr, spawn, tlsConf, proxy, redirects)
 	}
 }
 
-func agentWorker(serverAddr, targetAddr string, spawn chan<- struct{}, tlsConf *tlsPSKConfig, proxy *proxyOptions) {
+func agentWorker(serverAddr, targetAddr string, spawn chan<- struct{}, tlsConf *tlsPSKConfig, proxy *proxyOptions, redirects redirectRules) {
 	id := nextAgentConnID()
 
 	respawn := func(delay time.Duration) {
@@ -498,10 +498,11 @@ func agentWorker(serverAddr, targetAddr string, spawn chan<- struct{}, tlsConf *
 		// Replay the activation read: it may contain a partial request line,
 		// a complete request, or request and payload in the same TCP segment.
 		conn := &readerConn{Conn: serverConn, reader: io.MultiReader(bytes.NewReader(buf[:n]), serverConn)}
-		serveProxyTunnel(conn, proxy)
+		serveProxyTunnel(conn, proxy, redirects)
 		return
 	}
 
+	targetAddr = redirects.rewrite("tcp", targetAddr)
 	log.Printf("[agent-%d] received %d bytes, connecting target: %s", id, n, targetAddr)
 
 	targetConn, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)

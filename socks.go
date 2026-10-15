@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -53,7 +54,7 @@ func (c *readerConn) CloseWrite() error {
 	return c.Conn.Close()
 }
 
-func serveProxyTunnel(c net.Conn, options *proxyOptions) {
+func serveProxyTunnel(c net.Conn, options *proxyOptions, redirects redirectRules) {
 	defer c.Close()
 	c.SetReadDeadline(time.Now().Add(30 * time.Second))
 	reader := bufio.NewReader(c)
@@ -63,6 +64,19 @@ func serveProxyTunnel(c net.Conn, options *proxyOptions) {
 	}
 	c = &readerConn{Conn: c, reader: reader}
 	if string(prefix) != apps.TUNNEL_REQ_UDP {
+		if len(redirects) != 0 && string(prefix) == apps.TUNNEL_REQ_TCP {
+			line, err := netx.ReadString(c, '\n', 1024)
+			if err != nil {
+				return
+			}
+			original := strings.TrimPrefix(strings.TrimSpace(line), apps.TUNNEL_REQ_TCP)
+			target := redirects.rewrite("tcp", original)
+			if target != original {
+				line = apps.TUNNEL_REQ_TCP + target + "\n"
+			}
+			// Replay the request for gonc, preserving buffered payload and half-close.
+			c = &readerConn{Conn: c, reader: io.MultiReader(strings.NewReader(line), c)}
+		}
 		apps.ServeTunnelConn(&options.config, c)
 		return
 	}
@@ -72,7 +86,7 @@ func serveProxyTunnel(c net.Conn, options *proxyOptions) {
 	c.SetReadDeadline(time.Time{})
 	// Keep UDP lifecycle management local: the pinned gonc UDP handler has an
 	// unmatched WaitGroup.Add and cannot finish after its forwarding loops stop.
-	serveUDPTunnel(c, options.udpTimeout)
+	serveUDPTunnel(c, options.udpTimeout, redirects)
 }
 
 func serveProxyClient(client net.Conn, pool *connPool, options *proxyOptions) {

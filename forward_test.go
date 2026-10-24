@@ -157,6 +157,54 @@ func TestFixedEntriesShareProxyPool(t *testing.T) {
 	forwardUDPRoundTrip(t, rawUDP[1], relay, []byte("fixed-udp-still-active"))
 }
 
+func TestFixedUDPExplicitTCPWithoutDTLS(t *testing.T) {
+	for _, scheme := range []string{"tcp", "tls"} {
+		t.Run(scheme, func(t *testing.T) {
+			targets := []*net.UDPAddr{udpEcho(t), udpEcho(t)}
+			poolEndpoint := scheme + "://127.0.0.1:0"
+			if scheme == "tls" {
+				poolEndpoint += "?psk=fixed-udp-tcp-regression"
+			}
+			server := startProcess(t, "server",
+				"-listen", "udp://127.0.0.1:0?to=charon:500",
+				"-listen", "udp://127.0.0.1:0?to=charon:4500",
+				"-accept", poolEndpoint, "-udp-transport", "tcp")
+			entries := entryAddresses(t, server, 2)
+			connect := scheme + "://" + listenerAddress(t, server, "agent")
+			if scheme == "tls" {
+				connect += "?psk=fixed-udp-tcp-regression"
+			}
+			agent := startProcess(t, "agent", "-connect", connect, "-pool", "1",
+				"-redirect", "udp://charon:500="+targets[0].String(),
+				"-redirect", "udp://charon:4500="+targets[1].String())
+			clients := []*net.UDPConn{forwardUDPClient(t), forwardUDPClient(t)}
+			// Keep both sessions active while the single idle pool replenishes.
+			// Preserve empty datagrams, NAT keepalives, binary payloads, and
+			// frames larger than a TLS record through the old stream carrier.
+			payloads := [][]byte{nil, {0xff}, make([]byte, 28),
+				append([]byte{0, 0, 0, 0}, bytes.Repeat([]byte{0x20}, 1300)...),
+				bytes.Repeat([]byte{0xa5}, 60000)}
+			for _, payload := range payloads {
+				for i, client := range clients {
+					relay, err := net.ResolveUDPAddr("udp4", entries[i])
+					if err != nil {
+						t.Fatal(err)
+					}
+					forwardUDPRoundTrip(t, client, relay, payload)
+				}
+			}
+			await(t, func() bool {
+				return strings.Count(server.logs.String(), "agent connection pooled:") == 3
+			}, server.logs.String)
+			if strings.Count(server.logs.String(), "(transport=tcp)") != 2 ||
+				strings.Count(agent.logs.String(), "(transport=tcp)") != 2 ||
+				strings.Contains(server.logs.String(), "UDP agent") {
+				t.Fatalf("unexpected UDP carrier:\nserver:\n%s\nagent:\n%s", server.logs.String(), agent.logs.String())
+			}
+		})
+	}
+}
+
 func TestFixedUDPIdleAndAgentRecovery(t *testing.T) {
 	target := udpEcho(t)
 	server := startProcess(t, "server", "-listen", "udp://127.0.0.1:0?to=charon.invalid:500", "-accept", "127.0.0.1:0", "-udp-timeout", "300ms")

@@ -41,6 +41,63 @@ backpipe agent -connect "tls://server_host:10086?psk=tunnel-key" -pool 20 \
 
 防火墙按需开放 TCP 1080、8080、10086 和 UDP 500、4500。公网使用 SOCKS5 UDP 代理时，还需允许访问 server 动态分配的 UDP 端口，详见后面的“UDP 行为与公网部署”；固定 UDP 转发只使用配置的监听端口。
 
+### 增加原生 UDP 隧道（v1.4.0）
+
+在前面的 TLS 连接池之外，增加独立的 DTLS 会话池，让 UDP 业务在 server 与 agent 之间也通过 UDP 传输。SOCKS5/HTTP 客户端、固定转发目标和 agent 重定向规则均无需改变：
+
+```sh
+backpipe server -listen "socks5s://:1080?psk=client-key" \
+  -listen "socks5://127.0.0.1:3180" \
+  -listen "udp://:500?to=charon:500" \
+  -listen "udp://:4500?to=charon:4500" \
+  -listen "tcp://:8080?to=web:80" \
+  -accept "tls://:10086?psk=tunnel-key" \
+  -accept "dtls://:10086?psk=tunnel-key" \
+  -udp-transport udp
+
+backpipe agent -connect "tls://server_host:10086?psk=tunnel-key" \
+  -connect "dtls://server_host:10086?psk=tunnel-key" \
+  -pool 20 -udp-pool 20 \
+  -redirect "udp://charon:500=10.1.2.3:500" \
+  -redirect "udp://charon:4500=10.1.2.3:4500" \
+  -redirect "tcp://web:80=10.1.2.3:80"
+```
+
+TCP/TLS 和 DTLS 可以使用相同的数字端口，分别监听 TCP/10086 与 UDP/10086；防火墙需要额外开放 **UDP/10086**。两种池可以使用不同 PSK，但每种池的 server 与 agent 配置必须匹配。`psk=@文件路径` 同样适用于 DTLS。
+
+`-pool 20` 维持 20 条空闲 TCP/TLS 连接，`-udp-pool 20` 另外维持 20 个空闲 DTLS 会话。每个 UDP 业务会话独占一个 DTLS 会话，agent 使用独立 UDP socket 主动连接 server，不将多个业务会话复用到一条连接内。空闲 DTLS 会话通过保活维持连通性，断线重建，业务激活后自动补池；业务结束后关闭，不放回空闲池。保活不会延长业务的 `-udp-timeout`。
+
+server 的 `-udp-transport` 固定选择 UDP 业务的隧道类型；未指定时，配置了 DTLS 池便使用 `udp`，否则使用 `tcp`。TCP 业务始终使用 TCP/TLS 池：
+
+| 值 | 行为 |
+|----|------|
+| `udp` | 使用 DTLS 会话；需要配置 DTLS 池，等待可用会话超时或激活失败时结束该业务会话 |
+| `tcp` | UDP 继续封装在 TCP/TLS 池连接中，与原有传输方式一致 |
+
+两种方式之间**不自动回退或迁移**。DTLS 握手、就绪检查、激活失败或活动会话断线时，结束对应会话；agent 独立重连、补池，后续新业务仍使用配置的传输方式。不会将已发送的业务数据自动重放到另一条隧道。DTLS 池握手后的就绪检查与业务激活需要确认；已有 TCP/TLS 池仍不增加注册握手。
+
+仅转发固定 UDP 端口时，也可以只使用 DTLS：
+
+```sh
+backpipe server -listen "udp://:500?to=charon:500" \
+  -listen "udp://:4500?to=charon:4500" \
+  -accept "dtls://:10086?psk=tunnel-key" -udp-transport udp
+
+backpipe agent -connect "dtls://server_host:10086?psk=tunnel-key" -udp-pool 20 \
+  -redirect "udp://charon:500=10.1.2.3:500" \
+  -redirect "udp://charon:4500=10.1.2.3:4500"
+```
+
+SOCKS5/HTTP 或 TCP 入口仍要求配置 TCP/TLS 池，确保 TCP 请求可以被处理。`-accept`、`-connect` 各允许最多一个 TCP/TLS 地址和一个 DTLS 地址。agent 的 `-target` 模式不支持 DTLS；固定 UDP 目标应写在 server 的 `-listen ...?to=...` 中。
+
+DTLS 使用 1.2 版本，通过 PSK 派生证书进行双向认证，使用具有前向安全性的 ECDHE 与 AEAD 加密。认证思路与现有 TLS 池一致，但 DTLS 是独立的 UDP 协议，不能拿 TLS 客户端连接 DTLS 端口。客户端 `socks5s://` 的协议保持不变。
+
+`-udp-mtu` 默认 `1200`，范围 `576..8192`，表示 DTLS 隧道发送时的**外层 UDP 载荷预算**，包含 DTLS 和 backpipe 帧开销，不包含外层 IP/UDP 头。双方协商取配置中的较小值。它不是 strongSwan 的内层 MTU，也不是业务 UDP 包长上限。建议两端配置一致，并按 server-agent 路径 MTU 调整；例如已确认路径 MTU 为 1500 时，还需要为 IPv4/IPv6 和其他网络封装预留头部空间，不能直接设置为 1500。
+
+业务包超出预算时，backpipe 在 **server-agent 的 DTLS 隧道内部**切片，另一端收齐后还原完整 UDP 数据报，再发给目标或客户端。重组有内存和超时限制；缺片则丢弃整包，不重传业务数据，也不保证业务数据报有序。DTLS 握手与会话控制的重试不改变这一点。配置过大的预算仍可能触发 IP 分片或路径丢包；配置过小则增加切片数和处理开销。
+
+server 的状态日志中，`idle` 是空闲 TCP/TLS 连接数，`udp-idle` 是空闲 DTLS 会话数。UDP 代理和固定转发日志显示 `transport=dtls` 或 `transport=tcp`，可确认业务实际使用的隧道类型。
+
 ## 工作原理
 
 以通过上游出口节点访问 TCP 目标为例，常规代理链和 backpipe 的区别在于 **server 与出口节点之间，谁主动建立连接**。下图箭头表示 TCP 连接的发起方向，即首个 SYN 的发送方向；三次握手本身是双向交互，不表示数据只能沿箭头单向传输。
@@ -65,9 +122,9 @@ backpipe 中，agent 提前向 server 发起 TCP 连接；启用加密时，再�
 响应：用户客户端 ← server ← agent ← target
 ```
 
-以上握手方向示例针对 TCP 目标。代理 UDP 时，server-agent 之间仍使用 agent 主动建立的 TCP/TLS 池连接，agent 到 target 则发送 UDP 数据报，没有 TCP 握手。
+以上握手方向示例针对 TCP 目标。代理 UDP 时，server-agent 之间可以使用 agent 主动建立的 TCP/TLS 池连接，也可以使用独立 DTLS 会话池；agent 到 target 发送 UDP 数据报。DTLS 的握手通过 UDP 完成，没有 TCP SYN。
 
-每个会话独占一条连接，不使用 mux 多路复用。TCP 建立成功后（启用 TLS 时则在认证成功后），连接直接进入空闲池，不额外发送 backpipe 注册消息或应用层 ACK。首个业务请求激活连接后，agent 立即建立新连接补充空闲池。
+每个会话独占一条连接，不使用 mux 多路复用。TCP 建立成功后（启用 TLS 时则在认证成功后），连接直接进入空闲池，不额外发送 backpipe 注册消息或应用层 ACK。首个业务请求激活连接后，agent 立即建立新连接补充空闲池。DTLS 池另外执行就绪和激活确认，确保首个业务数据报在双方准备好之后发送。
 
 `-pool` 指定的是**空闲连接数**，不是并发会话上限。已使用的连接在会话结束后关闭，不放回池中。
 
@@ -124,7 +181,7 @@ backpipe agent -connect "tls://server_host:10086?psk=tunnel-key" -pool 20
 
 两个入口都支持 TCP 和 UDP。公网客户端连接 `socks5s://server_host:1080?psk=client-key`；本地应用连接 `127.0.0.1:3180`，使用普通 SOCKS5 或 HTTP 代理。本地入口省去客户端到 server 的加密开销，server 到 agent 的连接池仍然加密。
 
-每个 SOCKS5 入口可以独立配置监听地址、用户名、密码和 PSK，不同入口的凭据互不通用。也可以同时添加 `tcp://地址?to=目标` 和 `udp://地址?to=目标` 固定转发入口，详见后文。所有这些入口共享同一个空闲池，`-pool 20` 表示总共维持 20 条空闲连接。关闭某个入口上的会话，不影响其他入口的会话。
+每个 SOCKS5 入口可以独立配置监听地址、用户名、密码和 PSK，不同入口的凭据互不通用。也可以同时添加 `tcp://地址?to=目标` 和 `udp://地址?to=目标` 固定转发入口，详见后文。所有入口共享配置的连接池，`-pool 20` 表示总共维持 20 条空闲 TCP/TLS 连接；配置 DTLS 时，再由 `-udp-pool` 独立控制 UDP 会话池。关闭某个入口上的会话，不影响其他入口的会话。
 
 所有监听端口（包括 `-accept`）均绑定成功后才开始提供服务。任一端口绑定失败，server 会释放此前已绑定的端口，并报告失败的入口。日志显示入口地址和协议，不输出凭据。
 
@@ -225,9 +282,11 @@ backpipe agent -connect "tls://server_host:10086?psk=tunnel-key" -pool 20 \
 
 UDP 回包从 server 的原监听端口返回原客户端，例如上例始终通过 server 的 UDP 500 端口回复。agent 内部仍按实际回复来源封包，server 解包后只将原始 UDP 数据交给客户端，不需要给 `-redirect` 增加反向地址映射。目标服务看到的是 agent 的出口地址和自动分配的 UDP 源端口，不保留客户端源地址，也不保证源端口为 500。
 
-UDP 默认空闲 `2m` 后释放会话，双向流量都会延长存活时间；可在 server 和 agent 两端设置 `-udp-timeout 5m`。超时或隧道断开后，下一包重新取用池连接，agent 的 UDP 源端口可能变化。每个固定 UDP 入口最多维持 1024 个会话，其中等待 agent 就绪的会话最多 128 个；每会话最多排队 16 个数据报，入口总排队载荷最多 8 MiB。等待 agent 超时或超过这些容量时会丢包。UDP 数据仍封装在连接池的 TCP/TLS 连接中，TCP 重传可能延迟同一会话的后续数据报。
+UDP 默认空闲 `2m` 后释放会话，双向流量都会延长存活时间；可在 server 和 agent 两端设置 `-udp-timeout 5m`。超时或隧道断开后，下一包重新取用池连接，agent 的 UDP 源端口可能变化。使用 TCP/TLS 池时，TCP 重传可能延迟同一会话的后续数据报；使用 DTLS 池时，业务数据不重传，丢包由上层应用处理。
 
-固定转发入口 `tcp://`、`udp://` 本身不提供 TLS+PSK 或代理用户名认证；`-accept/-connect tls://...` 加密的是 server 与 agent 之间的连接。客户端到 server 的加密取决于应用协议自身。固定 UDP 入口只需开放配置的 UDP 监听端口，例如 UDP/500；连接池另需开放 TCP/10086，不使用 SOCKS5 动态分配的 UDP 端口。
+每个固定 UDP 入口最多维持 1024 个会话，其中等待 agent 就绪的会话最多 128 个。从 v1.4.1 起，每个会话的待发送队列同时受 **256 个数据报、256 KiB 载荷**两项上限限制；同一入口所有会话的等待载荷合计最多 **8 MiB**。若接收新包会超过任一上限，则丢弃该包。这些预算只统计应用等待队列，不包括已经出队、正在构帧或发送的数据，以及内核 socket 缓冲。等待 agent 超时或会话结束时，未转发的排队数据也会丢弃。
+
+固定转发入口 `tcp://`、`udp://` 本身不提供 TLS+PSK 或代理用户名认证；`-accept/-connect tls://...` 或 `dtls://...` 加密的是 server 与 agent 之间的连接。客户端到 server 的加密取决于应用协议自身。固定 UDP 入口只需开放配置的 UDP 监听端口，例如 UDP/500；连接池另按配置开放 TCP/10086、UDP/10086，不使用 SOCKS5 动态分配的 UDP 端口。
 
 `udp://` 必须指定 `to`；`to` 只能用于 TCP/UDP 监听入口，且只能出现一次。目标格式为 `host:port`，端口范围为 1～65535；IPv6 使用方括号，例如 `-listen "tcp://:8080?to=[2001:db8::1]:80"`。每个入口只有一个固定目标，需要多个规则时重复指定 `-listen`。
 
@@ -284,12 +343,16 @@ UDP 会缓存会话内已解析的目标，命中缓存时不重复打印重定�
 
 - 每个 UDP ASSOCIATE 占用一条池连接，并在 **server** 上分配一个临时 UDP 端口；一个会话可以访问多个目标。
 - 默认向客户端回复 `0.0.0.0` 和实际分配的端口；显式指定 `-socks-server-ip` 时使用配置 IP。实际 socket 仍绑定在 TCP 控制连接的本机 IP 上。
-- 客户端 UDP 包通过 server-agent 的 TCP/TLS 连接封装转发，再由 agent 以 UDP 发往目标。TCP 重传可能延迟同一会话中的后续数据报。
+- 客户端 UDP 包按 `-udp-transport` 选择 TCP/TLS 或 DTLS 池，再由 agent 以 UDP 发往目标。TCP 重传可能延迟同一会话中的后续数据报；DTLS 业务包不重传、不保证有序。
 - SOCKS TCP 控制连接必须保持打开。控制连接关闭、隧道断开或空闲超时，都会结束 UDP 会话并关闭相关 socket。
 - 默认空闲超时为 `2m`。修改时可在两端都设置 `-udp-timeout 5m`；两端不一致时，较短的超时会先触发。
 - 防火墙和安全组需要允许访问动态分配的 UDP 端口，仅开放 UDP/1080 不够。SOCKS5 UDP 代理目前不支持固定或共享 UDP 端口，也不支持配置分配端口范围；固定目标转发可使用 `-listen "udp://:端口?to=目标:端口"`。
 - server 位于 NAT 后时，支持 `0.0.0.0` 回退的客户端会使用所连接的代理 IP。需要明确指定回复地址时，可设置 `-socks-server-ip 公网IP`。NAT 仍需将分配的 UDP 端口按同号映射到 server，此参数不会自动创建映射。
-- UDP 来源 IP 必须与 TCP 控制连接的对端 IP 一致；首个有效数据包确定实际来源端口。不会拿 UDP ASSOCIATE 请求里的地址和端口过滤数据，兼容 gonc 及 NAT 后的客户端。不支持分片 SOCKS5 UDP 数据报。
+- UDP 来源 IP 必须与 TCP 控制连接的对端 IP 一致；首个有效数据包确定实际来源端口。不会拿 UDP ASSOCIATE 请求里的地址和端口过滤数据，兼容 gonc 及 NAT 后的客户端。不支持客户端发送的分片 SOCKS5 UDP 数据报；DTLS 隧道内部切片不改变 SOCKS5 协议。
+
+server 的 SOCKS5 UDP socket、固定 UDP 监听 socket，以及 agent 的业务 UDP 出口 socket，都会向操作系统请求 **1 MiB 接收缓冲**。操作系统可能按自身限制调整实际大小；设置失败会记录日志，但不终止服务。这些内核缓冲与固定 UDP 入口的应用等待队列分别计量。
+
+agent 的回包处理仍是读取一个业务 UDP 包、写入隧道，再读取下一个包。扩大接收缓冲用于吸收短时突发；持续拥塞仍可能造成写入阻塞和接收丢包。
 
 排查时可关注这些日志：
 
@@ -299,6 +362,26 @@ UDP 会缓存会话内已解析的目标，命中缓存时不重复打印重定�
 | `[server] UDP client bound: ...` | server 收到并接受了首个有效客户端 UDP 包 |
 | `[agent] UDP forwarding: ... -> ...` | agent 首次成功将 UDP 包交给本机 socket 发往目标，不代表目标已收到或回复 |
 | `[server] UDP association ended: ... (sent=N received=M packets)` | 会话结束；`sent` 为成功写入 agent 隧道的包数，`received` 为从隧道返回并成功写入客户端 UDP socket 的包数 |
+| `[server] UDP forward stats: ...` | 固定 UDP 入口的会话数、排队量和本地丢弃/写失败汇总；每 10 秒检查，有变化才输出，入口清理结束时输出最终汇总 |
+| `[server] UDP forward ended: ...` | 固定 UDP 会话结束时输出 `sent`、`received`、`dropped`、`queue_peak_packets`、`queue_peak_bytes`；未成功激活的会话也会记录 |
+
+固定 UDP 转发统计同时适用于 TCP/TLS 和 DTLS 隧道。入口快照中的 `sessions`、`pending` 分别是当前会话数和等待 agent 就绪的会话数；`queued_packets`、`queued_bytes` 是当前等待队列的包数和载荷字节数，`peak_packets`、`peak_bytes` 是该入口启动以来的峰值。会话结束日志中的 `queue_peak_packets`、`queue_peak_bytes` 只统计该会话的队列峰值。
+
+`dropped` 是下列分类计数之和，每个包按首个命中的原因计一次。入口计数在运行期间累计，会话结束日志则显示该会话的计数：
+
+| 分类 | 含义 |
+|------|------|
+| `queue_packets` | 新包会使单会话等待包数超过 256 |
+| `session_bytes` | 新包会使单会话等待载荷超过 256 KiB |
+| `listener_bytes` | 新包会使该入口总等待载荷超过 8 MiB |
+| `pending_limit` | 等待 agent 就绪的会话数已达上限，无法创建新会话 |
+| `session_limit` | 该入口的会话数已达上限，无法创建新会话 |
+| `oversize` | 数据报超过当前转发格式允许的大小 |
+| `closing` | 收到包时，入口或会话已经结束 |
+| `abandoned` | 会话结束时仍未发送的排队包 |
+| `write_error` | 向 agent 隧道或客户端 UDP socket 写入失败 |
+
+这些指标只反映 backpipe **主动丢弃的数据和本地写失败**，不能表示内核接收缓冲或网络链路的总丢包。`write_error` 发生前可能已经发送部分数据，例如 DTLS 包的部分切片，因此也不等于确定未送达的完整数据报数。排查接收缓冲溢出或链路丢包时，还应结合操作系统 UDP 计数和抓包结果。
 
 ## 参数说明
 
@@ -307,10 +390,13 @@ UDP 会缓存会话内已解析的目标，命中缓存时不重复打印重定�
 | 参数 | 角色 | 默认值与用途 |
 |------|------|--------------|
 | `-listen` | server | 必填，可重复；代理入口 `socks5://`、`socks5s://`；固定转发 `tcp://地址?to=目标`、`udp://地址?to=目标`；裸 `tcp://` 配合 agent `-target` |
-| `-accept` | server | 必填；agent 连接池监听地址，支持裸地址、`tcp://`、`tls://` |
-| `-connect` | agent | 必填；server 连接池地址，支持裸地址、`tcp://`、`tls://` |
+| `-accept` | server | 必填，可重复；最多一个裸地址/`tcp://`/`tls://` 与一个 `dtls://` 池监听地址 |
+| `-connect` | agent | 必填，可重复；最多一个裸地址/`tcp://`/`tls://` 与一个 `dtls://` 池连接地址 |
 | `-target` | agent | 省略时处理代理和带 `to` 的 TCP/UDP 转发；指定时仅配合不带 `to` 的 TCP 入口 |
-| `-pool` | agent | `5`；要维持的空闲连接数 |
+| `-pool` | agent | `5`；要维持的空闲 TCP/TLS 连接数 |
+| `-udp-pool` | agent | `20`；要维持的空闲 DTLS 会话数，显式指定时要求配置 DTLS 池 |
+| `-udp-transport` | server | `tcp` 或 `udp`；未指定时有 DTLS 池则为 `udp`，否则为 `tcp`；无自动回退 |
+| `-udp-mtu` | 两端 | `1200`；DTLS 外层 UDP 载荷预算，范围 `576..8192`，显式指定时要求配置 DTLS 池 |
 | `-redirect` | agent | 可重复；`[tcp://\|udp://]host:port=host:port`，默认同时匹配 TCP/UDP |
 | `-allow` | server | agent IP 白名单，以逗号分隔；留空时不限制 agent IP |
 | `-ppv2` | server | `false`；发送 PROXY v2 头，仅支持不带 `to` 的 TCP 入口 |
@@ -336,7 +422,7 @@ gonc 依赖固定到提交 `41d3f96c03fec9fbcf7ed9524b61792fca61ebee`，对应�
 
 测试覆盖真实 server/agent 进程、普通和加密多入口共享连接池、端口绑定失败回滚、gonc TCP/UDP 及 HTTP CONNECT 兼容、HTTP GET/POST 和 HTTPS 转发、PSK 拒绝、TLS 版本与套件协商、每会话 UDP 加密、SOCKS 认证、半关闭、空闲清理、断线重连、自动补池、固定目标转发，以及出站重定向、HTTP Host 保留和 UDP 实际回复来源。
 
-TCP 转发使用 gonc 导出的隧道处理接口。UDP 帧格式与 gonc 兼容，会话清理由 backpipe 自行管理，以避开所固定依赖版本中的等待组和共享地址问题。
+TCP 转发使用 gonc 导出的隧道处理接口。TCP/TLS 池中的 UDP 帧格式与 gonc 兼容，DTLS 池使用 backpipe 自身的数据报帧、控制消息和切片重组协议。会话清理由 backpipe 自行管理，以避开所固定依赖版本中的等待组和共享地址问题。启用 DTLS 时，server 与 agent 都需要升级到 v1.4.0 或更新版本；未启用 DTLS 的配置沿用已有传输方式。
 
 ## 许可证
 

@@ -12,7 +12,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/threatexpert/gonc/v2/netx"
 	"github.com/threatexpert/gonc/v2/secure"
 )
 
@@ -20,6 +19,9 @@ import (
 // compatible with gonc's tunnel protocol. A timed-out partial frame terminates
 // the association; it must never be retried as the start of the next frame.
 func readUDPFrame(r io.Reader, buf []byte) ([]byte, error) {
+	if packets, ok := r.(udpPacketTunnel); ok {
+		return packets.ReadPacket(buf)
+	}
 	var size [2]byte
 	if _, err := io.ReadFull(r, size[:]); err != nil {
 		return nil, err
@@ -33,6 +35,9 @@ func readUDPFrame(r io.Reader, buf []byte) ([]byte, error) {
 }
 
 func writeUDPFrame(w io.Writer, packet []byte) error {
+	if packets, ok := w.(udpPacketTunnel); ok {
+		return packets.WritePacket(packet)
+	}
 	if len(packet) == 0 || len(packet) > 65535 {
 		return fmt.Errorf("invalid UDP packet length: %d", len(packet))
 	}
@@ -81,6 +86,7 @@ func serveUDPAssociation(client, tunnel net.Conn, options *proxyOptions, key [32
 		socksReply(client, 1, nil)
 		return
 	}
+	configureBusinessUDPReadBuffer(udp, "server")
 	defer udp.Close()
 	var packets net.PacketConn = udp
 	if options.entryTLS != nil {
@@ -92,13 +98,7 @@ func serveUDPAssociation(client, tunnel net.Conn, options *proxyOptions, key [32
 			return
 		}
 	}
-	tunnel.SetDeadline(time.Now().Add(30 * time.Second))
-	if err := writeAll(tunnel, []byte("udp://0.0.0.0:0\n")); err != nil {
-		socksReply(client, 1, nil)
-		return
-	}
-	response, err := netx.ReadString(tunnel, '\n', 1024)
-	if err != nil || response != "OK\n" {
+	if err := openUDPTunnel(context.Background(), tunnel); err != nil {
 		socksReply(client, 1, nil)
 		return
 	}
@@ -116,7 +116,10 @@ func serveUDPAssociation(client, tunnel net.Conn, options *proxyOptions, key [32
 		return
 	}
 	client.SetDeadline(time.Time{})
+	var refreshMu sync.Mutex
 	refresh := func() {
+		refreshMu.Lock()
+		defer refreshMu.Unlock()
 		deadline := time.Now().Add(options.udpTimeout)
 		udp.SetDeadline(deadline)
 		tunnel.SetDeadline(deadline)
@@ -125,7 +128,7 @@ func serveUDPAssociation(client, tunnel net.Conn, options *proxyOptions, key [32
 	var peerMu sync.Mutex
 	var endpoint *net.UDPAddr
 	var sent, received int64
-	log.Printf("[server] UDP association: %s via %s", peer, udp.LocalAddr())
+	log.Printf("[server] UDP association: %s via %s (transport=%s)", peer, udp.LocalAddr(), udpTransportName(tunnel))
 	runUDPLoops(func() {
 		client.Close()
 		tunnel.Close()
@@ -193,19 +196,31 @@ func serveUDPAssociation(client, tunnel net.Conn, options *proxyOptions, key [32
 }
 
 func serveUDPTunnel(tunnel net.Conn, idle time.Duration, redirects redirectRules) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	udp, err := net.ListenUDP("udp", nil)
 	if err != nil {
 		writeAll(tunnel, []byte("ERROR: cannot create UDP socket\n"))
 		return
 	}
+	configureBusinessUDPReadBuffer(udp, "agent")
 	defer udp.Close()
 	tunnel.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	if err := writeAll(tunnel, []byte("OK\n")); err != nil {
 		return
 	}
+	serveUDPExit(tunnel, udp, idle, redirects)
+}
+
+// DTLS opens this socket before acknowledging OPEN; the TCP path sends OK
+// above. Both transports use exactly the same redirect and reply semantics.
+func serveUDPExit(tunnel net.Conn, udp *net.UDPConn, idle time.Duration, redirects redirectRules) {
+	defer tunnel.Close()
+	defer udp.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var refreshMu sync.Mutex
 	refresh := func() {
+		refreshMu.Lock()
+		defer refreshMu.Unlock()
 		deadline := time.Now().Add(idle)
 		udp.SetDeadline(deadline)
 		tunnel.SetDeadline(deadline)
@@ -250,7 +265,7 @@ func serveUDPTunnel(tunnel net.Conn, idle time.Duration, redirects redirectRules
 			if _, err := udp.WriteToUDP(payload, dst); err != nil {
 				log.Printf("[agent] UDP send to %s: %v", dst, err)
 			} else if firstPacket {
-				log.Printf("[agent] UDP forwarding: %s -> %s", udp.LocalAddr(), dst)
+				log.Printf("[agent] UDP forwarding: %s -> %s (transport=%s)", udp.LocalAddr(), dst, udpTransportName(tunnel))
 				firstPacket = false
 			}
 		}

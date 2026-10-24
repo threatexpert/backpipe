@@ -14,7 +14,7 @@ import (
 	"github.com/threatexpert/gonc/v2/secure"
 )
 
-const usage = `backpipe - reverse tunnel with independent pooled TCP connections
+const usage = `backpipe - reverse tunnel with independent TCP and DTLS session pools
 
 Usage:
   backpipe server -listen socks5://:1080 -accept :10086
@@ -27,6 +27,9 @@ Usage:
 
   backpipe server -listen "udp://:500?to=charon:500" -listen "tcp://:8080?to=web:80" -listen socks5://:1080 -accept :10086
   backpipe agent -connect server_host:10086 -pool 20 -redirect "udp://charon:500=10.1.2.3:500"
+
+  backpipe server -listen "udp://:500?to=charon:500" -accept "dtls://:10086?psk=tunnel-key"
+  backpipe agent -connect "dtls://server_host:10086?psk=tunnel-key" -udp-pool 20
 
   backpipe server -listen tcp://:8080 -accept :10086
   backpipe agent -connect server_host:10086 -target 127.0.0.1:80
@@ -64,7 +67,7 @@ func parseEndpoint(value, option string) (endpoint, error) {
 	case "listen":
 		allowed = allowed || ep.scheme == "udp" || ep.scheme == "socks5" || ep.scheme == "socks5s"
 	case "accept", "connect":
-		allowed = allowed || ep.scheme == "tls"
+		allowed = allowed || ep.scheme == "tls" || ep.scheme == "dtls"
 	case "target":
 	default:
 		return fail("unknown endpoint option")
@@ -94,7 +97,7 @@ func parseEndpoint(value, option string) (endpoint, error) {
 	if err != nil {
 		return fail("invalid query encoding")
 	}
-	encrypted := ep.scheme == "tls" || ep.scheme == "socks5s"
+	encrypted := ep.scheme == "tls" || ep.scheme == "dtls" || ep.scheme == "socks5s"
 	for key, values := range query {
 		if len(values) != 1 {
 			return fail("query parameters must not be repeated")
@@ -102,7 +105,7 @@ func parseEndpoint(value, option string) (endpoint, error) {
 		switch key {
 		case "psk":
 			if !encrypted {
-				return fail("psk is only supported for TLS")
+				return fail("psk is only supported for TLS or DTLS")
 			}
 		case "to":
 			if option != "listen" || (ep.scheme != "tcp" && ep.scheme != "udp") {
@@ -125,7 +128,7 @@ func parseEndpoint(value, option string) (endpoint, error) {
 			return fail("cannot read PSK file")
 		}
 		if ep.psk == "" {
-			return fail("TLS requires a nonempty psk (literal value or @file)")
+			return fail("TLS/DTLS requires a nonempty psk (literal value or @file)")
 		}
 	}
 	return ep, nil
@@ -140,7 +143,11 @@ type commandConfig struct {
 	role           string
 	entries        []entryConfig
 	tunnel, target endpoint
+	tunnels        []endpoint
 	pool           int
+	udpPool        int
+	udpTransport   string
+	udpMTU         int
 	allow          string
 	ppv2           bool
 	proxy          *proxyOptions
@@ -151,34 +158,44 @@ func parseCommand(role string, args []string, output io.Writer) (*commandConfig,
 	if role != "server" && role != "agent" {
 		return nil, fmt.Errorf("expected server or agent subcommand; use backpipe -help")
 	}
-	c := &commandConfig{role: role}
+	c := &commandConfig{role: role, udpPool: 20, udpMTU: defaultDatagramMTU}
 	fs := flag.NewFlagSet(role, flag.ContinueOnError)
 	// flag.Parse includes offending values in its errors; suppress those so
 	// malformed URLs and misplaced options cannot expose keys in diagnostics.
 	fs.SetOutput(io.Discard)
 	var listens []string
 	var redirects []string
-	var accept, connect, target, serverIP string
+	var tunnels []string
+	var target, serverIP string
 	var idle time.Duration
 	if role == "server" {
 		fs.Func("listen", "client entry (repeatable): tcp://addr?to=host:port, udp://addr?to=host:port, socks5://[user:pass@]addr, socks5s://[user:pass@]addr?psk=key; SOCKS5 also accepts HTTP; bare tcp://addr requires agent -target", func(value string) error {
 			listens = append(listens, value)
 			return nil
 		})
-		fs.StringVar(&accept, "accept", "", "agent pool listener: host:port or tls://host:port?psk=key")
+		fs.Func("accept", "agent pool listener (repeatable, one stream and one DTLS): host:port, tls://host:port?psk=key, dtls://host:port?psk=key", func(value string) error {
+			tunnels = append(tunnels, value)
+			return nil
+		})
+		fs.StringVar(&c.udpTransport, "udp-transport", "", "UDP tunnel transport: tcp or udp; defaults to udp with a DTLS pool, otherwise tcp; no automatic fallback")
 		fs.StringVar(&c.allow, "allow", "", "comma-separated agent IP whitelist")
 		fs.StringVar(&serverIP, "socks-server-ip", "", "advertised UDP relay IP (default: 0.0.0.0; clients use the TCP peer IP)")
 		fs.BoolVar(&c.ppv2, "ppv2", false, "inject PROXY v2 header (bare tcp:// listener with agent -target only)")
 	} else {
-		fs.StringVar(&connect, "connect", "", "server pool address: host:port or tls://host:port?psk=key")
+		fs.Func("connect", "server pool address (repeatable, one stream and one DTLS): host:port, tls://host:port?psk=key, dtls://host:port?psk=key", func(value string) error {
+			tunnels = append(tunnels, value)
+			return nil
+		})
 		fs.StringVar(&target, "target", "", "fixed TCP target for bare tcp:// listeners; omit for SOCKS5/HTTP and listeners with ?to=host:port")
-		fs.IntVar(&c.pool, "pool", 5, "desired idle connections; active sessions are additional")
+		fs.IntVar(&c.pool, "pool", 5, "desired idle TCP/TLS connections; active sessions are additional")
+		fs.IntVar(&c.udpPool, "udp-pool", 20, "desired idle DTLS sessions; requires dtls://; active sessions are additional")
 		fs.Func("redirect", "outbound target rewrite (repeatable): [tcp://|udp://]host:port=host:port; no protocol matches both", func(value string) error {
 			redirects = append(redirects, value)
 			return nil
 		})
 	}
 	fs.DurationVar(&idle, "udp-timeout", 2*time.Minute, "UDP idle timeout for SOCKS5 and fixed forwarding; set on both peers")
+	fs.IntVar(&c.udpMTU, "udp-mtu", defaultDatagramMTU, fmt.Sprintf("maximum outer UDP payload in bytes (%d..%d); requires dtls://; set on both peers", minDatagramMTU, maxDatagramMTU))
 	fs.Usage = func() {
 		fmt.Fprintf(output, "backpipe %s options:\n", role)
 		fs.SetOutput(output)
@@ -194,6 +211,55 @@ func parseCommand(role string, args []string, output io.Writer) (*commandConfig,
 	}
 	if fs.NArg() != 0 {
 		return nil, fmt.Errorf("unexpected positional arguments; use backpipe %s -help", role)
+	}
+	specified := make(map[string]bool)
+	fs.Visit(func(f *flag.Flag) { specified[f.Name] = true })
+	tunnelOption := "accept"
+	if role == "agent" {
+		tunnelOption = "connect"
+	}
+	if len(tunnels) == 0 {
+		return nil, fmt.Errorf("at least one -%s is required", tunnelOption)
+	}
+	hasDTLS := false
+	for i, value := range tunnels {
+		ep, err := parseEndpoint(value, tunnelOption)
+		if err != nil {
+			return nil, fmt.Errorf("pool endpoint %d: %w", i+1, err)
+		}
+		if ep.scheme == "dtls" {
+			if hasDTLS {
+				return nil, fmt.Errorf("-%s accepts at most one DTLS endpoint", tunnelOption)
+			}
+			hasDTLS = true
+		} else {
+			if c.tunnel.scheme != "" {
+				return nil, fmt.Errorf("-%s accepts at most one TCP/TLS endpoint", tunnelOption)
+			}
+			c.tunnel = ep
+		}
+		c.tunnels = append(c.tunnels, ep)
+	}
+	if !hasDTLS && (specified["udp-pool"] || specified["udp-mtu"]) {
+		return nil, fmt.Errorf("-udp-pool and -udp-mtu require a DTLS pool endpoint")
+	}
+	if c.udpPool < 1 {
+		return nil, fmt.Errorf("-udp-pool must be at least 1")
+	}
+	if c.udpMTU < minDatagramMTU || c.udpMTU > maxDatagramMTU {
+		return nil, fmt.Errorf("-udp-mtu must be between %d and %d", minDatagramMTU, maxDatagramMTU)
+	}
+	if !specified["udp-transport"] {
+		c.udpTransport = "tcp"
+		if hasDTLS {
+			c.udpTransport = "udp"
+		}
+	}
+	if c.udpTransport != "tcp" && c.udpTransport != "udp" {
+		return nil, fmt.Errorf("-udp-transport must be tcp or udp")
+	}
+	if c.udpTransport == "udp" && !hasDTLS {
+		return nil, fmt.Errorf("-udp-transport udp requires a DTLS pool endpoint")
 	}
 	var err error
 	if c.redirects, err = parseRedirectRules(redirects); err != nil {
@@ -216,10 +282,13 @@ func parseCommand(role string, args []string, output io.Writer) (*commandConfig,
 			}
 			proxyMode = isProxy
 			hasSOCKS = hasSOCKS || ep.scheme == "socks5" || ep.scheme == "socks5s"
+			if c.tunnel.scheme == "" && (ep.scheme != "udp" || c.udpTransport == "tcp") {
+				return nil, fmt.Errorf("SOCKS5/HTTP, TCP listeners and -udp-transport tcp require a TCP/TLS pool endpoint")
+			}
 			c.entries = append(c.entries, entryConfig{endpoint: ep})
 		}
-		if c.tunnel, err = parseEndpoint(accept, "accept"); err != nil {
-			return nil, err
+		if !proxyMode && hasDTLS {
+			return nil, fmt.Errorf("bare TCP listeners cannot share a DTLS pool; use listeners with to")
 		}
 		if proxyMode && c.ppv2 {
 			return nil, fmt.Errorf("-ppv2 requires a bare tcp:// listener with agent -target")
@@ -231,11 +300,11 @@ func parseCommand(role string, args []string, output io.Writer) (*commandConfig,
 		if c.pool < 1 {
 			return nil, fmt.Errorf("-pool must be at least 1")
 		}
-		if c.tunnel, err = parseEndpoint(connect, "connect"); err != nil {
-			return nil, err
-		}
 		proxyMode = target == ""
 		if !proxyMode {
+			if hasDTLS {
+				return nil, fmt.Errorf("-target cannot be combined with a DTLS pool endpoint")
+			}
 			if c.target, err = parseEndpoint(target, "target"); err != nil {
 				return nil, err
 			}
@@ -245,13 +314,7 @@ func parseCommand(role string, args []string, output io.Writer) (*commandConfig,
 		return nil, fmt.Errorf("-udp-timeout must be positive")
 	}
 	if !proxyMode {
-		var specified bool
-		fs.Visit(func(f *flag.Flag) {
-			if f.Name == "udp-timeout" {
-				specified = true
-			}
-		})
-		if specified {
+		if specified["udp-timeout"] {
 			return nil, fmt.Errorf("-udp-timeout requires SOCKS5 or listeners using to; omit agent -target")
 		}
 	} else if role == "agent" {
@@ -298,14 +361,8 @@ func runCLI(args []string, output io.Writer) error {
 	if err != nil {
 		return err
 	}
-	proto := "plain"
-	if c.tunnel.scheme == "tls" {
-		proto = "tls"
-	}
 	if c.role == "server" {
-		return runServer(c.entries, c.tunnel.address, parseWhitelist(c.allow), proto, c.tunnel.psk, c.ppv2)
-	} else {
-		runAgent(c.tunnel.address, c.target.address, c.pool, proto, c.tunnel.psk, c.proxy, c.redirects)
+		return runConfiguredServer(c)
 	}
-	return nil
+	return runConfiguredAgent(c)
 }

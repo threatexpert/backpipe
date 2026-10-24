@@ -9,18 +9,17 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/threatexpert/gonc/v2/netx"
 )
 
 // UDP has no accept/backpressure mechanism. Bound both sessions waiting for an
 // agent and queued datagrams so an unavailable or slow agent cannot grow memory
 // without limit. Limits apply independently to each forwarding listener.
 const (
-	udpForwardMaxPending     = 128
-	udpForwardMaxSessions    = 1024
-	udpForwardQueuePackets   = 16
-	udpForwardMaxQueuedBytes = 8 * 1024 * 1024
+	udpForwardMaxPending         = 128
+	udpForwardMaxSessions        = 1024
+	udpForwardQueuePackets       = 256
+	udpForwardSessionQueuedBytes = 256 * 1024
+	udpForwardMaxQueuedBytes     = 8 * 1024 * 1024
 )
 
 type udpForwarder struct {
@@ -32,21 +31,26 @@ type udpForwarder struct {
 	ctx     context.Context
 	writes  chan struct{} // serialize shared-socket writes and their deadlines
 
-	mu          sync.Mutex
-	sessions    map[string]*udpForwardSession
-	pending     int
-	queuedBytes int
-	wg          sync.WaitGroup
+	mu         sync.Mutex
+	sessions   map[string]*udpForwardSession
+	pending    int
+	queueStats udpForwardQueueStats
+	drops      udpForwardDrops
+	lastReport udpForwardSnapshot
+	wg         sync.WaitGroup
 }
 
 type udpForwardSession struct {
-	owner   *udpForwarder
-	peer    *net.UDPAddr
-	key     string
-	packets chan []byte
-	ctx     context.Context
-	cancel  context.CancelFunc
-	pending bool // protected by owner.mu
+	owner          *udpForwarder
+	peer           *net.UDPAddr
+	key            string
+	packets        chan []byte
+	ctx            context.Context
+	cancel         context.CancelFunc
+	pending        bool                 // protected by owner.mu
+	queueStats     udpForwardQueueStats // protected by owner.mu
+	drops          udpForwardDrops      // protected by owner.mu
+	sent, received int64                // one writer per direction; read after both loops end
 
 	connMu    sync.Mutex
 	tunnel    net.Conn
@@ -80,11 +84,17 @@ func serveUDPForward(udp *net.UDPConn, pool *connPool, target string, options *p
 	if err != nil {
 		return fmt.Errorf("[server] UDP forward target: %w", err)
 	}
+	configureBusinessUDPReadBuffer(udp, "server")
 	ctx, cancel := context.WithCancel(context.Background())
 	f := &udpForwarder{
 		udp: udp, pool: pool, target: target, header: header, options: options,
 		ctx: ctx, writes: make(chan struct{}, 1), sessions: make(map[string]*udpForwardSession),
 	}
+	statsDone := make(chan struct{})
+	go func() {
+		defer close(statsDone)
+		f.reportLoop()
+	}()
 	defer func() {
 		cancel()
 		udp.Close()
@@ -98,17 +108,14 @@ func serveUDPForward(udp *net.UDPConn, pool *connPool, target string, options *p
 			s.stop()
 		}
 		f.wg.Wait()
+		<-statsDone
+		f.reportStats(true)
 	}()
 	buf := make([]byte, 65535)
 	for {
 		n, peer, err := udp.ReadFromUDP(buf)
 		if err != nil {
 			return fmt.Errorf("[server] UDP listener %s stopped: %w", udp.LocalAddr(), err)
-		}
-		// The existing tunnel's 16-bit length includes the destination header.
-		// Oversized datagrams are dropped without disturbing a live session.
-		if n+len(header) > 65535 {
-			continue
 		}
 		f.enqueue(peer, buf[:n])
 	}
@@ -118,12 +125,27 @@ func (f *udpForwarder) enqueue(peer *net.UDPAddr, payload []byte) {
 	key := peer.String()
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.queuedBytes+len(payload) > udpForwardMaxQueuedBytes {
+	s := f.sessions[key]
+	if f.ctx.Err() != nil || (s != nil && s.ctx.Err() != nil) {
+		f.dropLocked(s, udpDropClosing, 1)
 		return
 	}
-	s := f.sessions[key]
+	// The tunnel's 16-bit length includes the logical destination header.
+	if len(payload)+len(f.header) > 65535 {
+		f.dropLocked(s, udpDropOversize, 1)
+		return
+	}
+	if f.queueStats.bytes+len(payload) > udpForwardMaxQueuedBytes {
+		f.dropLocked(s, udpDropListenerBytes, 1)
+		return
+	}
 	if s == nil {
-		if f.pending >= udpForwardMaxPending || len(f.sessions) >= udpForwardMaxSessions {
+		if f.pending >= udpForwardMaxPending {
+			f.dropLocked(nil, udpDropPendingLimit, 1)
+			return
+		}
+		if len(f.sessions) >= udpForwardMaxSessions {
+			f.dropLocked(nil, udpDropSessionLimit, 1)
 			return
 		}
 		ctx, cancel := context.WithCancel(f.ctx)
@@ -136,12 +158,52 @@ func (f *udpForwarder) enqueue(peer *net.UDPAddr, payload []byte) {
 		f.wg.Add(1)
 		go s.run()
 	}
-	if s.ctx.Err() != nil || len(s.packets) == cap(s.packets) {
+	if s.queueStats.packets >= udpForwardQueuePackets {
+		f.dropLocked(s, udpDropQueuePackets, 1)
+		return
+	}
+	if s.queueStats.bytes+len(payload) > udpForwardSessionQueuedBytes {
+		f.dropLocked(s, udpDropSessionBytes, 1)
 		return
 	}
 	packet := append([]byte(nil), payload...)
-	f.queuedBytes += len(packet)
+	f.queueStats.add(len(packet))
+	s.queueStats.add(len(packet))
 	s.packets <- packet
+}
+
+func (s *udpForwardSession) dequeue(payload []byte) {
+	s.owner.mu.Lock()
+	defer s.owner.mu.Unlock()
+	s.releaseQueuedLocked(payload)
+}
+
+func (s *udpForwardSession) releaseQueuedLocked(payload []byte) {
+	s.queueStats.packets--
+	s.queueStats.bytes -= len(payload)
+	s.owner.queueStats.packets--
+	s.owner.queueStats.bytes -= len(payload)
+}
+
+// Called after the forwarding loops have joined. The waiting queue budget does
+// not include the one in-flight datagram or its encoded tunnel frame.
+func (s *udpForwardSession) cleanup() {
+	s.stop()
+	f := s.owner
+	f.mu.Lock()
+	delete(f.sessions, s.key)
+	if s.pending {
+		f.pending--
+		s.pending = false
+	}
+	for len(s.packets) > 0 {
+		payload := <-s.packets
+		s.releaseQueuedLocked(payload)
+		f.dropLocked(s, udpDropAbandoned, 1)
+	}
+	drops, queue := s.drops, s.queueStats
+	f.mu.Unlock()
+	log.Printf("[server] UDP forward ended: %s via %s (sent=%d received=%d packets dropped=%d queue_peak_packets=%d queue_peak_bytes=%d)", s.peer, f.udp.LocalAddr(), s.sent, s.received, drops.total(), queue.peakPackets, queue.peakBytes)
 }
 
 func (s *udpForwardSession) stop() {
@@ -202,19 +264,8 @@ func (s *udpForwardSession) writeReply(payload []byte) error {
 func (s *udpForwardSession) run() {
 	f := s.owner
 	defer f.wg.Done()
-	defer func() {
-		s.stop()
-		f.mu.Lock()
-		delete(f.sessions, s.key)
-		if s.pending {
-			f.pending--
-		}
-		for len(s.packets) > 0 {
-			f.queuedBytes -= len(<-s.packets)
-		}
-		f.mu.Unlock()
-	}()
-	tunnel := pickUDPForwardTunnel(s.ctx, f.pool, f.options.poolWait)
+	defer s.cleanup()
+	tunnel := selectUDPTunnel(s.ctx, f.pool, f.options)
 	if tunnel == nil {
 		if s.ctx.Err() == nil {
 			log.Printf("[server] no agent connection available, dropping UDP forward: %s via %s", s.peer, f.udp.LocalAddr())
@@ -226,12 +277,7 @@ func (s *udpForwardSession) run() {
 	}
 	atomic.AddInt64(&relayCount, 1)
 	defer atomic.AddInt64(&relayCount, -1)
-	tunnel.SetDeadline(time.Now().Add(30 * time.Second))
-	if err := writeAll(tunnel, []byte("udp://0.0.0.0:0\n")); err != nil {
-		return
-	}
-	response, err := netx.ReadString(tunnel, '\n', 1024)
-	if err != nil || response != "OK\n" {
+	if err := openUDPTunnel(s.ctx, tunnel); err != nil {
 		log.Printf("[server] UDP forward tunnel setup failed: %s via %s", s.peer, f.udp.LocalAddr())
 		return
 	}
@@ -240,25 +286,27 @@ func (s *udpForwardSession) run() {
 	f.pending--
 	f.mu.Unlock()
 	s.refresh()
-	var sent, received int64
-	log.Printf("[server] UDP forward: %s via %s -> %s", s.peer, f.udp.LocalAddr(), f.target)
+	log.Printf("[server] UDP forward: %s via %s -> %s (transport=%s)", s.peer, f.udp.LocalAddr(), f.target, udpTransportName(tunnel))
 	runUDPLoops(s.stop, func() {
 		for {
 			select {
 			case <-s.ctx.Done():
 				return
 			case payload := <-s.packets:
-				f.mu.Lock()
-				f.queuedBytes -= len(payload)
-				f.mu.Unlock()
+				s.dequeue(payload)
+				if s.ctx.Err() != nil {
+					f.recordDrop(s, udpDropAbandoned)
+					return
+				}
 				packet := make([]byte, 0, len(f.header)+len(payload))
 				packet = append(packet, f.header...)
 				packet = append(packet, payload...)
 				s.refresh()
 				if err := writeUDPFrame(tunnel, packet); err != nil {
+					f.recordDrop(s, udpDropWriteError)
 					return
 				}
-				sent++
+				s.sent++
 			}
 		}
 	}, func() {
@@ -276,12 +324,12 @@ func (s *udpForwardSession) run() {
 			// The actual agent-side source stays in the internal frame. Raw UDP
 			// clients receive only payload, from the original server listen port.
 			if err := s.writeReply(payload); err != nil {
+				f.recordDrop(s, udpDropWriteError)
 				return
 			}
-			received++
+			s.received++
 		}
 	})
-	log.Printf("[server] UDP forward ended: %s via %s (sent=%d received=%d packets)", s.peer, f.udp.LocalAddr(), sent, received)
 }
 
 // Unlike the TCP accept loop, one UDP reader serves every client. Pool waits

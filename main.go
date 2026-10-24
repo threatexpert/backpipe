@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-const Version = "v1.3.0"
+const Version = "v1.4.1"
 
 func main() {
 	if err := runCLI(os.Args[1:], os.Stdout); err != nil {
@@ -119,6 +119,7 @@ type connPool struct {
 	mu      sync.Mutex
 	entries []*poolEntry
 	avail   chan struct{} // signaled when a new connection is available
+	closed  bool
 }
 
 func newConnPool() *connPool {
@@ -135,6 +136,11 @@ func (p *connPool) add(c net.Conn) {
 	}
 
 	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		c.Close()
+		return
+	}
 	p.entries = append(p.entries, e)
 	p.mu.Unlock()
 
@@ -248,6 +254,17 @@ func (p *connPool) size() int {
 	return n
 }
 
+func (p *connPool) close() {
+	p.mu.Lock()
+	p.closed = true
+	entries := p.entries
+	p.entries = nil
+	p.mu.Unlock()
+	for _, e := range entries {
+		e.conn.Close()
+	}
+}
+
 var relayCount int64 // atomic: active relay sessions
 
 // A client entry binds one transport; UDP has no Accept operation.
@@ -280,9 +297,22 @@ func bindServerListeners(entries []entryConfig, poolAddr string) (net.Listener, 
 	if err != nil {
 		return nil, nil, fmt.Errorf("agent pool listen on %s: %w", poolAddr, err)
 	}
+	listeners, err := bindClientListeners(entries)
+	if err != nil {
+		poolLn.Close()
+		return nil, nil, err
+	}
+	return poolLn, listeners, nil
+}
+
+func bindClientListeners(entries []entryConfig) ([]serverListener, error) {
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("at least one client entry is required")
+	}
 	var listeners []serverListener
 	for i, entry := range entries {
 		var ln serverListener
+		var err error
 		if entry.endpoint.scheme == "udp" {
 			var addr *net.UDPAddr
 			addr, err = net.ResolveUDPAddr("udp", entry.endpoint.address)
@@ -296,59 +326,11 @@ func bindServerListeners(entries []entryConfig, poolAddr string) (net.Listener, 
 			for _, bound := range listeners {
 				bound.Close()
 			}
-			poolLn.Close()
-			return nil, nil, fmt.Errorf("entry %d (%s) listen on %s: %w", i+1, entry.endpoint.scheme, entry.endpoint.address, err)
+			return nil, fmt.Errorf("entry %d (%s) listen on %s: %w", i+1, entry.endpoint.scheme, entry.endpoint.address, err)
 		}
 		listeners = append(listeners, ln)
 	}
-	return poolLn, listeners, nil
-}
-
-func runServer(entries []entryConfig, poolAddr string, whitelist map[string]bool, proto, psk string, ppv2 bool) error {
-	var tlsConf *tlsPSKConfig
-	if proto == "tls" {
-		var err error
-		tlsConf, err = newTLSPSKConfig(psk, false)
-		if err != nil {
-			return fmt.Errorf("[server] failed to init TLS: %w", err)
-		}
-	}
-	poolLn, listeners, err := bindServerListeners(entries, poolAddr)
-	if err != nil {
-		return fmt.Errorf("[server] startup failed: %w", err)
-	}
-	defer poolLn.Close()
-	defer func() {
-		for _, ln := range listeners {
-			ln.Close()
-		}
-	}()
-
-	if tlsConf != nil {
-		log.Printf("[server] agent pool: TLS 1.2-1.3 with PSK mutual authentication")
-	}
-	log.Printf("[server] waiting for agent connections on %s", poolLn.Addr())
-	for i, ln := range listeners {
-		log.Printf("[server] waiting for user connections on %s (entry %d: %s)", ln.Addr(), i+1, entries[i].endpoint.scheme)
-		if target := entries[i].endpoint.target; target != "" {
-			log.Printf("[server] forwarding entry %d: %s -> %s via agent", i+1, entries[i].endpoint.scheme, target)
-		}
-	}
-	pool := newConnPool()
-	go acceptPoolConns(poolLn, pool, whitelist, tlsConf)
-	go statusTicker(pool)
-	finished := make(chan error, len(listeners))
-	for i, ln := range listeners {
-		go func() {
-			entry := entries[i]
-			if ln.udp != nil {
-				finished <- serveUDPForward(ln.udp, pool, entry.endpoint.target, entry.proxy)
-			} else {
-				finished <- acceptUserConns(ln.tcp, pool, ppv2, entry)
-			}
-		}()
-	}
-	return <-finished
+	return listeners, nil
 }
 
 func acceptUserConns(ln net.Listener, pool *connPool, ppv2 bool, entry entryConfig) error {
@@ -404,23 +386,6 @@ func acceptPoolConns(ln net.Listener, pool *connPool, whitelist map[string]bool,
 			log.Printf("[server] agent connection pooled: %s", conn.RemoteAddr())
 			pool.add(conn)
 		}(c)
-	}
-}
-
-func statusTicker(pool *connPool) {
-	_idleOld := -1
-	_relaysOld := -1
-	_idle := 0
-	_relays := 0
-	for {
-		time.Sleep(1 * time.Second)
-		_idle = pool.size()
-		_relays = int(atomic.LoadInt64(&relayCount))
-		if _idle != _idleOld || _relays != _relaysOld {
-			log.Printf("[server] status: idle=%d relays=%d", _idle, _relays)
-			_idleOld = _idle
-			_relaysOld = _relays
-		}
 	}
 }
 

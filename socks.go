@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/subtle"
 	"encoding/binary"
 	"fmt"
@@ -18,10 +19,12 @@ import (
 )
 
 type proxyOptions struct {
-	config     apps.Socks5uConfig
-	udpTimeout time.Duration
-	poolWait   time.Duration
-	entryTLS   *tlsPSKConfig
+	config       apps.Socks5uConfig
+	udpTimeout   time.Duration
+	poolWait     time.Duration
+	entryTLS     *tlsPSKConfig
+	udpPool      *datagramPool
+	udpTransport string
 }
 
 func newProxyOptions(serverIP string, idle time.Duration) (*proxyOptions, error) {
@@ -136,7 +139,12 @@ func serveProxyClient(client net.Conn, pool *connPool, options *proxyOptions) {
 	// Authenticate and parse before claiming: idle/unauthenticated clients must
 	// not reserve agent connections or cause the agent to replenish its pool.
 	client.SetDeadline(time.Now().Add(options.poolWait + 30*time.Second))
-	tunnel := pool.pick(options.poolWait)
+	var tunnel net.Conn
+	if header[1] == 3 {
+		tunnel = selectUDPTunnel(context.Background(), pool, options)
+	} else {
+		tunnel = pool.pick(options.poolWait)
+	}
 	if tunnel == nil {
 		socksReply(client, 1, nil)
 		return

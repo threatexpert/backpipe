@@ -52,7 +52,7 @@ func parseUDPPacket(packet []byte) (string, int, []byte, error) {
 		return "", 0, nil, fmt.Errorf("invalid or fragmented SOCKS5 UDP packet")
 	}
 	r := bytes.NewReader(packet[4:])
-	host, port, err := readSOCKSAddress(r, packet[3])
+	host, port, err := readSOCKSAddress(r, packet[3], false)
 	if err != nil {
 		return "", 0, nil, err
 	}

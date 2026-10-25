@@ -325,6 +325,11 @@ func TestSOCKSProxyEndToEnd(t *testing.T) {
 			unsupported.Write([]byte{5, 2, 0, 1})
 			clientReply(t, unsupported, 7)
 			unsupported.Close()
+			emptyTarget := dialClient(t, proxyAddr)
+			clientAuth(t, emptyTarget, "user:pass")
+			clientRequest(t, emptyTarget, 1, ":0", true)
+			clientReply(t, emptyTarget, 8)
+			emptyTarget.Close()
 			if n := strings.Count(server.logs.String(), "agent connection pooled:"); n != 2 {
 				t.Fatalf("unauthenticated/unsupported request replenished pool: %d", n)
 			}
@@ -366,7 +371,12 @@ func TestSOCKSProxyEndToEnd(t *testing.T) {
 			for i := 0; i < 2; i++ {
 				control := dialClient(t, proxyAddr)
 				clientAuth(t, control, "user:pass")
-				clientRequest(t, control, 3, "0.0.0.0:0", false)
+				if i == 0 {
+					clientRequest(t, control, 3, "0.0.0.0:0", false)
+				} else {
+					// Legacy gonc CreateSocks5UDPClient sends an empty domain.
+					clientRequest(t, control, 3, ":0", true)
+				}
 				relay := clientReply(t, control, 0)
 				if !relay.IP.Equal(net.IPv4(127, 0, 0, 1)) || relay.Port == 0 {
 					t.Fatalf("invalid server relay address: %s", relay)
@@ -399,6 +409,29 @@ func TestSOCKSProxyEndToEnd(t *testing.T) {
 			clientReply(t, c, 0)
 			c.Write([]byte("reconnected"))
 			expectBytes(t, c, []byte("reconnected"))
+		})
+	}
+}
+
+func TestSOCKSUDPAssociateEmptyDomain(t *testing.T) {
+	for _, proto := range []string{"plain", "tls"} {
+		t.Run(proto, func(t *testing.T) {
+			transport := func(addr string) string { return addr }
+			if proto == "tls" {
+				transport = func(addr string) string { return "tls://" + addr + "?psk=empty-domain-test" }
+			}
+			server := startProcess(t, "server", "-listen", "socks5://127.0.0.1:0", "-accept", transport("127.0.0.1:0"))
+			poolAddr := listenerAddress(t, server, "agent")
+			proxyAddr := listenerAddress(t, server, "user")
+			startProcess(t, "agent", "-connect", transport(poolAddr), "-pool", "1")
+			control := dialClient(t, proxyAddr)
+			clientAuth(t, control, "")
+			clientRequest(t, control, 3, ":0", true)
+			if relay := clientReply(t, control, 0); relay.Port == 0 {
+				t.Fatal("UDP ASSOCIATE returned a zero relay port")
+			}
+			control.Close()
+			await(t, func() bool { return strings.Contains(server.logs.String(), "UDP association ended:") }, server.logs.String)
 		})
 	}
 }

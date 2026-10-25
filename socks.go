@@ -131,7 +131,7 @@ func serveProxyClient(client net.Conn, pool *connPool, options *proxyOptions) {
 		socksReply(client, 7, nil) // CONNECT and UDP ASSOCIATE only
 		return
 	}
-	host, port, err := readSOCKSAddress(client, header[3])
+	host, port, err := readSOCKSAddress(client, header[3], header[1] == 3)
 	if err != nil {
 		socksReply(client, 8, nil)
 		return
@@ -210,7 +210,7 @@ func socksAuthenticate(c net.Conn, username, password string) error {
 	return writeAll(c, []byte{1, 0})
 }
 
-func readSOCKSAddress(r io.Reader, atyp byte) (string, int, error) {
+func readSOCKSAddress(r io.Reader, atyp byte, allowEmptyDomain bool) (string, int, error) {
 	var host string
 	switch atyp {
 	case 1, 4:
@@ -232,10 +232,15 @@ func readSOCKSAddress(r io.Reader, atyp byte) (string, int, error) {
 		if _, err := io.ReadFull(r, name); err != nil {
 			return "", 0, err
 		}
-		if len(name) == 0 || bytes.IndexFunc(name, func(r rune) bool { return r <= 32 || r == 127 }) >= 0 {
+		if (len(name) == 0 && !allowEmptyDomain) || bytes.IndexFunc(name, func(r rune) bool { return r <= 32 || r == 127 }) >= 0 {
 			return "", 0, fmt.Errorf("invalid SOCKS5 hostname")
 		}
 		host = string(name)
+		if host == "" {
+			// Older gonc clients encode an unspecified UDP ASSOCIATE address
+			// as an empty domain. Accept it only for association requests.
+			host = "0.0.0.0"
+		}
 	default:
 		return "", 0, fmt.Errorf("unsupported address type")
 	}

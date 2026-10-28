@@ -22,6 +22,12 @@ func udpTransportName(tunnel net.Conn) string {
 	if _, ok := tunnel.(udpPacketTunnel); ok {
 		return "dtls"
 	}
+	if _, ok := tunnel.(*kcpStreamConn); ok {
+		return "kcp+dtls"
+	}
+	if wrapped, ok := tunnel.(*readerConn); ok {
+		return udpTransportName(wrapped.Conn)
+	}
 	return "tcp"
 }
 

@@ -6,6 +6,7 @@ require (
 	github.com/pion/dtls/v3 v3.1.10
 	github.com/pion/transport/v5 v5.0.0
 	github.com/threatexpert/gonc/v2 v2.6.11-0.20261013082942-41d3f96c03fe
+	github.com/xtaci/kcp-go/v5 v5.6.72
 )
 
 require (
@@ -24,7 +25,6 @@ require (
 	github.com/threatexpert/go-winpty v1.0.3 // indirect
 	github.com/tjfoc/gmsm v1.4.1 // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect
-	github.com/xtaci/kcp-go/v5 v5.6.72 // indirect
 	github.com/xtaci/smux v1.5.57 // indirect
 	github.com/zeebo/blake3 v0.2.4 // indirect
 	golang.org/x/crypto v0.57.0 // indirect

@@ -1,0 +1,65 @@
+package main
+
+import (
+	"io"
+	"strings"
+	"testing"
+)
+
+func TestKCPCLICombinations(t *testing.T) {
+	for _, role := range []string{"server", "agent"} {
+		base, option := []string{"-listen", "socks5://:1080"}, "-accept"
+		if role == "agent" {
+			base, option = nil, "-connect"
+		}
+		for _, native := range []bool{false, true} {
+			args := append(append([]string{}, base...), option, "kcp+dtls://127.0.0.1:10086?psk=key")
+			if native {
+				args = append(args, option, "dtls://127.0.0.1:10087?psk=key")
+			}
+			c, err := parseCommand(role, args, io.Discard)
+			if err != nil {
+				t.Fatal(role, args, err)
+			}
+			want := "tcp"
+			if native {
+				want = "udp"
+			}
+			if c.tunnel.scheme != "kcp+dtls" || c.udpTransport != want {
+				t.Fatalf("unexpected configuration: %+v", c)
+			}
+			if role == "server" {
+				c, err = parseCommand(role, append(args, "-udp-transport", "stream"), io.Discard)
+				if err != nil || c.udpTransport != "tcp" {
+					t.Fatalf("stream selection: %v", err)
+				}
+			}
+		}
+		for _, extra := range [][]string{
+			{option, "tls://127.0.0.1:10088?psk=key"},
+			{option, "tcp://127.0.0.1:10088"},
+			{option, "kcp+dtls://127.0.0.1:10088?psk=key"},
+			{option, "dtls://127.0.0.1:10086?psk=key"},
+			{option, "dtls://127.0.0.1:010086?psk=key"},
+			{"-kcp-mtu", "1401"}, {"-kcp-mtu", "575"},
+			{"-kcp-heartbeat", "0s"}, {"-kcp-timeout", "1s"},
+		} {
+			args := append(append([]string{}, base...), option, "kcp+dtls://127.0.0.1:10086?psk=key")
+			if _, err := parseCommand(role, append(args, extra...), io.Discard); err == nil {
+				t.Fatal("accepted invalid KCP combination", role, extra)
+			}
+		}
+	}
+	for _, value := range []string{"kcp+dtls://host:10086", "kcp+dtls://user:pass@host:10086?psk=secret", "kcp+dtls://host:10086?psk=secret&unknown=yes"} {
+		_, err := parseEndpoint(value, "connect")
+		if err == nil || strings.Contains(err.Error(), "secret") {
+			t.Fatalf("bad endpoint diagnostic: %v", err)
+		}
+	}
+	if _, err := parseCommand("agent", []string{"-connect", "host:10086", "-kcp-mtu", "1200"}, io.Discard); err == nil {
+		t.Fatal("KCP options accepted without KCP")
+	}
+	if _, err := parseCommand("agent", []string{"-connect", "kcp+dtls://host:10086?psk=key", "-target", "127.0.0.1:80"}, io.Discard); err != nil {
+		t.Fatal("bare target rejected", err)
+	}
+}

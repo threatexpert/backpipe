@@ -88,7 +88,7 @@ backpipe agent -connect "dtls://server_host:10086?psk=tunnel-key" -udp-pool 20 \
   -redirect "udp://charon:4500=10.1.2.3:4500"
 ```
 
-SOCKS5/HTTP 或 TCP 入口仍要求配置 TCP/TLS 池，确保 TCP 请求可以被处理。`-accept`、`-connect` 各允许最多一个 TCP/TLS 地址和一个 DTLS 地址。agent 的 `-target` 模式不支持 DTLS；固定 UDP 目标应写在 server 的 `-listen ...?to=...` 中。
+SOCKS5/HTTP 或 TCP 入口要求配置流式池，确保 TCP 请求可以被处理。流式池可选 TCP/TLS 或下文的 KCP/DTLS。`-accept`、`-connect` 各允许最多一个流式地址和一个原生 DTLS 地址。agent 的 `-target` 模式不支持原生 DTLS；固定 UDP 目标应写在 server 的 `-listen ...?to=...` 中。
 
 DTLS 使用 1.2 版本，通过 PSK 派生证书进行双向认证，使用具有前向安全性的 ECDHE 与 AEAD 加密。认证思路与现有 TLS 池一致，但 DTLS 是独立的 UDP 协议，不能拿 TLS 客户端连接 DTLS 端口。客户端 `socks5s://` 的协议保持不变。
 
@@ -97,6 +97,46 @@ DTLS 使用 1.2 版本，通过 PSK 派生证书进行双向认证，使用具�
 业务包超出预算时，backpipe 在 **server-agent 的 DTLS 隧道内部**切片，另一端收齐后还原完整 UDP 数据报，再发给目标或客户端。重组有内存和超时限制；缺片则丢弃整包，不重传业务数据，也不保证业务数据报有序。DTLS 握手与会话控制的重试不改变这一点。配置过大的预算仍可能触发 IP 分片或路径丢包；配置过小则增加切片数和处理开销。
 
 server 的状态日志中，`idle` 是空闲 TCP/TLS 连接数，`udp-idle` 是空闲 DTLS 会话数。UDP 代理和固定转发日志显示 `transport=dtls` 或 `transport=tcp`，可确认业务实际使用的隧道类型。
+
+### KCP + DTLS 流式隧道（v1.5.0）
+
+`kcp+dtls://` 使用 UDP 建立 DTLS 加密连接，在 DTLS 内运行 KCP，为 TCP/HTTP 和 UDP 业务提供可靠、有序的流式隧道。可以单独使用，替代 TCP/TLS 连接池：
+
+```sh
+backpipe server -listen socks5://:1080 \
+  -listen "tcp://:8080?to=web:80" -listen "udp://:500?to=charon:500" \
+  -accept "kcp+dtls://:10086?psk=tunnel-key"
+
+backpipe agent -connect "kcp+dtls://server_host:10086?psk=tunnel-key" -pool 20 \
+  -redirect "tcp://web:80=10.1.2.3:80" -redirect "udp://charon:500=10.1.2.3:500"
+```
+
+此时所有 server-agent 业务均走 KCP/DTLS，只需为池入口开放 **UDP/10086**。客户端入口及目标仍使用其各自的 TCP/UDP 协议。KCP 与 TCP/TLS **互斥**，不能在同一进程中同时指定两种流式池，也没有自动回退。`-pool` 控制空闲 KCP 会话数量；每条业务独占一个会话，激活后补池，结束后关闭。裸 TCP 入口、agent `-target`、`-ppv2` 和 `-redirect` 同样适用。
+
+也可以保留独立的原生 UDP/DTLS 池，让 TCP/HTTP 走 KCP，UDP 业务继续使用不重传的数据报隧道：
+
+```sh
+backpipe server -listen socks5://:1080 \
+  -accept "kcp+dtls://:10086?psk=tunnel-key" \
+  -accept "dtls://:10087?psk=tunnel-key"
+
+backpipe agent -connect "kcp+dtls://server_host:10086?psk=tunnel-key" \
+  -connect "dtls://server_host:10087?psk=tunnel-key" -pool 20 -udp-pool 20
+```
+
+两种池都使用 UDP，必须配置**不同端口**，并分别开放防火墙。配置了原生 `dtls://` 时，UDP 业务默认选择原生 DTLS；server 添加 `-udp-transport stream` 可明确改为 KCP。旧的 `-udp-transport tcp` 是 `stream` 的兼容别名，表示当前流式池。KCP 承载 UDP 时会保留业务数据报边界，但 KCP 的重传会延迟同一会话中的后续数据报；需要保留 UDP 丢包语义时使用原生 DTLS。日志分别显示 `transport=kcp+dtls`、`transport=dtls`；`idle` 统计所选流式池，`udp-idle` 统计原生 DTLS 池。
+
+连接管理与关闭行为：
+
+- DTLS 双向认证后，双方交换带版本的 KCP 就绪帧，成功后才入池。KCP 数据、心跳和关闭确认均在 DTLS 加密层内；不是 TLS over KCP，也不能直接与 gonc 的 KCP 端口互连。
+- TCP 半关闭使用 KCP 内有序传输的 FIN，接收方读完 FIN 前的数据后得到 EOF，反向仍可发送。完整关闭最多等待 5 秒确认已发送的数据和 FIN；超过期限强制回收，不能保证断网时仍送达剩余数据。
+- `-kcp-heartbeat` 默认 `10s`，`-kcp-timeout` 默认 `30s`。空闲和活动会话都发送带序号的 ping/pong；连续超时未收到有效回复便关闭载体、解除读写阻塞并移除失效会话。心跳独立于业务读取，接收背压不会被误判成断线；心跳不延长 `-udp-timeout`。
+- agent 在空闲连接断开后按退避和抖动重连；活动会话在激活时就已补池。server 重启或网络恢复后，agent 重新建立会话。已中断的业务不会迁移或重放，新业务使用新连接。NAT 地址变化同样需要重建。
+- 接收缓存有上限，应用读取落后时由 KCP 流控产生背压。业务读写 deadline 可中断等待，部分接收帧在读超时后保留，避免超时破坏帧边界。
+
+`-kcp-mtu` 默认 `1200`，范围 `576..1400`，表示包含 DTLS 和 KCP 包装开销的外层 UDP 载荷预算，不含 IP/UDP 头；KCP 会进一步预留自己的包头。双方建议使用一致配置，当前不协商 MTU。`-udp-mtu` 仅控制原生 DTLS 池。KCP 启用拥塞控制和快速重传，不额外启用 FEC。`-kcp-*` 参数只在配置了 KCP 池时有效；心跳范围为 `50ms..1h`，超时须至少为心跳的三倍且不超过 `24h`。
+
+KCP 模式要求 server、agent 都升级到 v1.5.0。未使用 `kcp+dtls://` 时，TCP/TLS 与原生 DTLS 的线格式、认证、补池路径和默认传输选择保持不变；旧流式池不会增加 KCP 就绪帧、FIN 或心跳。
 
 ## 工作原理
 
@@ -390,13 +430,16 @@ agent 的回包处理仍是读取一个业务 UDP 包、写入隧道，再读取
 | 参数 | 角色 | 默认值与用途 |
 |------|------|--------------|
 | `-listen` | server | 必填，可重复；代理入口 `socks5://`、`socks5s://`；固定转发 `tcp://地址?to=目标`、`udp://地址?to=目标`；裸 `tcp://` 配合 agent `-target` |
-| `-accept` | server | 必填，可重复；最多一个裸地址/`tcp://`/`tls://` 与一个 `dtls://` 池监听地址 |
-| `-connect` | agent | 必填，可重复；最多一个裸地址/`tcp://`/`tls://` 与一个 `dtls://` 池连接地址 |
+| `-accept` | server | 必填，可重复；一个流式池（裸地址/`tcp://`/`tls://`/`kcp+dtls://` 四选一）和可选的原生 `dtls://` 池 |
+| `-connect` | agent | 必填，可重复；一个流式池（裸地址/`tcp://`/`tls://`/`kcp+dtls://` 四选一）和可选的原生 `dtls://` 池 |
 | `-target` | agent | 省略时处理代理和带 `to` 的 TCP/UDP 转发；指定时仅配合不带 `to` 的 TCP 入口 |
-| `-pool` | agent | `5`；要维持的空闲 TCP/TLS 连接数 |
+| `-pool` | agent | `5`；要维持的空闲 TCP/TLS 或 KCP/DTLS 流式连接数 |
 | `-udp-pool` | agent | `20`；要维持的空闲 DTLS 会话数，显式指定时要求配置 DTLS 池 |
-| `-udp-transport` | server | `tcp` 或 `udp`；未指定时有 DTLS 池则为 `udp`，否则为 `tcp`；无自动回退 |
+| `-udp-transport` | server | `stream`（旧别名 `tcp`）或 `udp`；未指定时有原生 DTLS 池则为 `udp`，否则使用流式池；无自动回退 |
 | `-udp-mtu` | 两端 | `1200`；DTLS 外层 UDP 载荷预算，范围 `576..8192`，显式指定时要求配置 DTLS 池 |
+| `-kcp-mtu` | 两端 | `1200`；KCP/DTLS 外层 UDP 载荷预算，范围 `576..1400`；要求 KCP 池 |
+| `-kcp-heartbeat` | 两端 | `10s`；KCP/DTLS 心跳间隔；要求 KCP 池 |
+| `-kcp-timeout` | 两端 | `30s`；KCP/DTLS 有效心跳回复超时，至少为心跳的三倍；要求 KCP 池 |
 | `-redirect` | agent | 可重复；`[tcp://\|udp://]host:port=host:port`，默认同时匹配 TCP/UDP |
 | `-allow` | server | agent IP 白名单，以逗号分隔；留空时不限制 agent IP |
 | `-ppv2` | server | `false`；发送 PROXY v2 头，仅支持不带 `to` 的 TCP 入口 |
@@ -421,6 +464,10 @@ Windows 下可运行 `build.bat` 构建 Windows 和 Linux amd64 程序，产物�
 gonc 依赖固定到提交 `41d3f96c03fec9fbcf7ed9524b61792fca61ebee`，对应伪版本 `v2.6.11-0.20261013082942-41d3f96c03fe`。不使用本地 `replace`，也无需额外发布 gonc 版本。
 
 测试覆盖真实 server/agent 进程、普通和加密多入口共享连接池、端口绑定失败回滚、gonc TCP/UDP 及 HTTP CONNECT 兼容、HTTP GET/POST 和 HTTPS 转发、PSK 拒绝、TLS 版本与套件协商、每会话 UDP 加密、SOCKS 认证、半关闭、空闲清理、断线重连、自动补池、固定目标转发，以及出站重定向、HTTP Host 保留和 UDP 实际回复来源。
+
+KCP 测试另外覆盖丢包、乱序、重复包、尾部数据与半关闭、关闭确认丢失、单向链路失效、背压与动态 deadline、协议错误、真实 DTLS 认证、agent 中断、server 重启补池、KCP 单独运行及与原生 DTLS 共存。可用 `go test -race . -run TestKCP` 执行 KCP 并发检查。
+
+升级兼容性测试可指定独立构建的 v1.4.2 程序：`BACKPIPE_LEGACY_BINARY=/absolute/path/to/backpipe-v1.4.2 go test . -run TestLegacyBinaryCompatibility`。测试覆盖新旧 server/agent 的两种搭配，以及 TCP、TLS、TLS 加原生 DTLS、仅原生 DTLS 四种配置；未指定旧程序时跳过此项。
 
 TCP 转发使用 gonc 导出的隧道处理接口。TCP/TLS 池中的 UDP 帧格式与 gonc 兼容，DTLS 池使用 backpipe 自身的数据报帧、控制消息和切片重组协议。会话清理由 backpipe 自行管理，以避开所固定依赖版本中的等待组和共享地址问题。启用 DTLS 时，server 与 agent 都需要升级到 v1.4.0 或更新版本；未启用 DTLS 的配置沿用已有传输方式。
 

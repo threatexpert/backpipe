@@ -34,6 +34,9 @@ func runConfiguredServer(c *commandConfig) error {
 		if ep.scheme == "dtls" {
 			udpPool = newDatagramPool()
 			datagramLn, err = listenDTLSPool(ep, c.udpMTU)
+		} else if ep.scheme == "kcp+dtls" {
+			streamPool = newConnPool()
+			streamLn, err = listenDTLSPool(ep, c.kcp.MTU)
 		} else {
 			streamPool = newConnPool()
 			if ep.scheme == "tls" {
@@ -60,11 +63,17 @@ func runConfiguredServer(c *commandConfig) error {
 	whitelist := parseWhitelist(c.allow)
 	finished := make(chan error, len(listeners)+1)
 	if streamLn != nil {
-		if tlsConf != nil {
+		if c.tunnel.scheme == "kcp+dtls" {
+			log.Printf("[server] agent pool: KCP over DTLS 1.2 with PSK mutual authentication, mtu=%d heartbeat=%s timeout=%s", c.kcp.MTU, c.kcp.Heartbeat, c.kcp.Timeout)
+		} else if tlsConf != nil {
 			log.Printf("[server] agent pool: TLS 1.2-1.3 with PSK mutual authentication")
 		}
 		log.Printf("[server] waiting for agent connections on %s", streamLn.Addr())
-		go acceptPoolConns(streamLn, streamPool, whitelist, tlsConf)
+		if c.tunnel.scheme == "kcp+dtls" {
+			go func() { finished <- acceptKCPPoolConns(ctx, streamLn, streamPool, whitelist, c.kcp) }()
+		} else {
+			go acceptPoolConns(streamLn, streamPool, whitelist, tlsConf)
+		}
 	}
 	if datagramLn != nil {
 		log.Printf("[server] waiting for UDP agent connections on %s (DTLS 1.2, PSK mutual authentication, mtu=%d)", datagramLn.Addr(), c.udpMTU)
@@ -127,6 +136,8 @@ func runConfiguredAgent(c *commandConfig) error {
 	for _, ep := range c.tunnels {
 		if ep.scheme == "dtls" {
 			go func() { finished <- runDTLSAgent(ctx, ep, c.udpPool, c.udpMTU, c.proxy.udpTimeout, c.redirects) }()
+		} else if ep.scheme == "kcp+dtls" {
+			go func() { finished <- runKCPAgent(ctx, ep, c.pool, c.kcp, c.target.address, c.proxy, c.redirects) }()
 		} else {
 			proto := "plain"
 			if ep.scheme == "tls" {

@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-const Version = "v1.4.2"
+const Version = "v1.5.0"
 
 func main() {
 	if err := runCLI(os.Args[1:], os.Stdout); err != nil {

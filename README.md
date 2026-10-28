@@ -136,6 +136,10 @@ backpipe agent -connect "kcp+dtls://server_host:10086?psk=tunnel-key" \
 
 `-kcp-mtu` 默认 `1200`，范围 `576..1400`，表示包含 DTLS 和 KCP 包装开销的外层 UDP 载荷预算，不含 IP/UDP 头；KCP 会进一步预留自己的包头。双方建议使用一致配置，当前不协商 MTU。`-udp-mtu` 仅控制原生 DTLS 池。KCP 启用拥塞控制和快速重传，不额外启用 FEC。`-kcp-*` 参数只在配置了 KCP 池时有效；心跳范围为 `50ms..1h`，超时须至少为心跳的三倍且不超过 `24h`。
 
+`-kcp-sndwnd` 和 `-kcp-rcvwnd` 分别设置本端的发送、接收窗口，单位为 KCP 分段，默认均为 `128`，范围 `128..4096`。例如在 server 和 agent 命令后均添加 `-kcp-sndwnd 1024 -kcp-rcvwnd 1024`。两端可以不同，但每个方向仍受对端接收窗口及拥塞控制限制。增大窗口不会启动时就分配全部载荷缓存；高并发、丢包或接收端积压时，内存占用可能增加。未指定参数时保持原来的窗口设置。
+
+所有 TCP 转发路径共用收尾逻辑：正常 EOF 发送半关闭，并给反向数据最多 30 秒排空；复制或半关闭出错则关闭两端。排空超时会中断读写并关闭连接，也覆盖阻塞的写入和半关闭操作，结束前等待转发协程退出。
+
 KCP 模式要求 server、agent 都升级到 v1.5.0。未使用 `kcp+dtls://` 时，TCP/TLS 与原生 DTLS 的线格式、认证、补池路径和默认传输选择保持不变；旧流式池不会增加 KCP 就绪帧、FIN 或心跳。
 
 ## 工作原理
@@ -438,6 +442,8 @@ agent 的回包处理仍是读取一个业务 UDP 包、写入隧道，再读取
 | `-udp-transport` | server | `stream`（旧别名 `tcp`）或 `udp`；未指定时有原生 DTLS 池则为 `udp`，否则使用流式池；无自动回退 |
 | `-udp-mtu` | 两端 | `1200`；DTLS 外层 UDP 载荷预算，范围 `576..8192`，显式指定时要求配置 DTLS 池 |
 | `-kcp-mtu` | 两端 | `1200`；KCP/DTLS 外层 UDP 载荷预算，范围 `576..1400`；要求 KCP 池 |
+| `-kcp-sndwnd` | 两端 | `128`；本端 KCP 发送窗口，范围 `128..4096` 分段；要求 KCP 池 |
+| `-kcp-rcvwnd` | 两端 | `128`；本端 KCP 接收窗口，范围 `128..4096` 分段；要求 KCP 池 |
 | `-kcp-heartbeat` | 两端 | `10s`；KCP/DTLS 心跳间隔；要求 KCP 池 |
 | `-kcp-timeout` | 两端 | `30s`；KCP/DTLS 有效心跳回复超时，至少为心跳的三倍；要求 KCP 池 |
 | `-redirect` | agent | 可重复；`[tcp://\|udp://]host:port=host:port`，默认同时匹配 TCP/UDP |
@@ -469,7 +475,7 @@ KCP 测试另外覆盖丢包、乱序、重复包、尾部数据与半关闭、�
 
 升级兼容性测试可指定独立构建的 v1.4.2 程序：`BACKPIPE_LEGACY_BINARY=/absolute/path/to/backpipe-v1.4.2 go test . -run TestLegacyBinaryCompatibility`。测试覆盖新旧 server/agent 的两种搭配，以及 TCP、TLS、TLS 加原生 DTLS、仅原生 DTLS 四种配置；未指定旧程序时跳过此项。
 
-TCP 转发使用 gonc 导出的隧道处理接口。TCP/TLS 池中的 UDP 帧格式与 gonc 兼容，DTLS 池使用 backpipe 自身的数据报帧、控制消息和切片重组协议。会话清理由 backpipe 自行管理，以避开所固定依赖版本中的等待组和共享地址问题。启用 DTLS 时，server 与 agent 都需要升级到 v1.4.0 或更新版本；未启用 DTLS 的配置沿用已有传输方式。
+TCP 转发由 backpipe 管理读写与收尾，保留与 gonc 兼容的 `tcp://目标地址` 请求及 `OK/ERROR` 响应格式。TCP/TLS 池中的 UDP 帧格式与 gonc 兼容，DTLS 池使用 backpipe 自身的数据报帧、控制消息和切片重组协议。会话清理由 backpipe 自行管理，以避开所固定依赖版本中的等待组和共享地址问题。启用 DTLS 时，server 与 agent 都需要升级到 v1.4.0 或更新版本；未启用 DTLS 的配置沿用已有传输方式。
 
 ## 许可证
 

@@ -204,6 +204,8 @@ func parseCommand(role string, args []string, output io.Writer) (*commandConfig,
 	fs.DurationVar(&idle, "udp-timeout", 2*time.Minute, "UDP idle timeout for SOCKS5 and fixed forwarding; set on both peers")
 	fs.IntVar(&c.udpMTU, "udp-mtu", defaultDatagramMTU, fmt.Sprintf("maximum outer UDP payload in bytes (%d..%d); requires dtls://; set on both peers", minDatagramMTU, maxDatagramMTU))
 	fs.IntVar(&c.kcp.MTU, "kcp-mtu", c.kcp.MTU, "maximum outer KCP/DTLS UDP payload (576..1400 bytes); requires kcp+dtls://")
+	fs.IntVar(&c.kcp.SendWindow, "kcp-sndwnd", c.kcp.SendWindow, "KCP send window (128..4096 segments); requires kcp+dtls://")
+	fs.IntVar(&c.kcp.ReceiveWindow, "kcp-rcvwnd", c.kcp.ReceiveWindow, "KCP receive window (128..4096 segments); requires kcp+dtls://")
 	fs.DurationVar(&c.kcp.Heartbeat, "kcp-heartbeat", c.kcp.Heartbeat, "KCP/DTLS heartbeat interval; requires kcp+dtls://")
 	fs.DurationVar(&c.kcp.Timeout, "kcp-timeout", c.kcp.Timeout, "KCP/DTLS peer response timeout (at least 3 heartbeat intervals); requires kcp+dtls://")
 	fs.Usage = func() {
@@ -250,8 +252,11 @@ func parseCommand(role string, args []string, output io.Writer) (*commandConfig,
 		}
 		c.tunnels = append(c.tunnels, ep)
 	}
-	if c.tunnel.scheme != "kcp+dtls" && (specified["kcp-mtu"] || specified["kcp-heartbeat"] || specified["kcp-timeout"]) {
+	if c.tunnel.scheme != "kcp+dtls" && (specified["kcp-mtu"] || specified["kcp-sndwnd"] || specified["kcp-rcvwnd"] || specified["kcp-heartbeat"] || specified["kcp-timeout"]) {
 		return nil, fmt.Errorf("KCP options require a kcp+dtls:// pool endpoint")
+	}
+	if !validKCPWindow(c.kcp.SendWindow) || !validKCPWindow(c.kcp.ReceiveWindow) {
+		return nil, fmt.Errorf("-kcp-sndwnd and -kcp-rcvwnd must be between 128 and 4096 segments")
 	}
 	if c.kcp.MTU < 576 || c.kcp.MTU > 1400 || c.kcp.Heartbeat < 50*time.Millisecond || c.kcp.Heartbeat > time.Hour || c.kcp.Timeout < 3*c.kcp.Heartbeat || c.kcp.Timeout > 24*time.Hour {
 		return nil, fmt.Errorf("KCP requires MTU 576..1400, heartbeat 50ms..1h, timeout at least 3 heartbeats and at most 24h")

@@ -8,6 +8,57 @@ import (
 	"time"
 )
 
+func TestPoolReleasesRemovedEntryReferences(t *testing.T) {
+	for _, claim := range []bool{false, true} {
+		name := "disconnect"
+		if claim {
+			name = "claim"
+		}
+		t.Run(name, func(t *testing.T) {
+			p := newConnPool()
+			defer p.close()
+			var peers []net.Conn
+			var entries []*poolEntry
+			for i := 0; i < 3; i++ {
+				s, peer := net.Pipe()
+				t.Cleanup(func() { s.Close(); peer.Close() })
+				peers = append(peers, peer)
+				p.add(s)
+			}
+			p.mu.Lock()
+			entries = append(entries, p.entries...)
+			p.mu.Unlock()
+			// Removing the middle entry first also exercises slice compaction.
+			for step, index := range []int{1, 0, 2} {
+				if claim {
+					c := p.tryClaim()
+					if c == nil {
+						t.Fatal("live entry could not be claimed")
+					}
+					c.Close()
+				} else {
+					peers[index].Close()
+					select {
+					case <-entries[index].done:
+					case <-time.After(time.Second):
+						t.Fatal("disconnected entry monitor did not exit")
+					}
+				}
+				p.mu.Lock()
+				length := len(p.entries)
+				retained := false
+				for _, e := range p.entries[length:cap(p.entries)] {
+					retained = retained || e != nil
+				}
+				p.mu.Unlock()
+				if length != 2-step || retained {
+					t.Fatalf("after removal %d: length=%d, backing array retains removed entries=%v", step, length, retained)
+				}
+			}
+		})
+	}
+}
+
 type gatedReadConn struct {
 	net.Conn
 	returned chan struct{}

@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -193,7 +194,7 @@ func (p *connPool) removeEntry(target *poolEntry) {
 	defer p.mu.Unlock()
 	for i, e := range p.entries {
 		if e == target {
-			p.entries = append(p.entries[:i], p.entries[i+1:]...)
+			p.entries = slices.Delete(p.entries, i, i+1)
 			return
 		}
 	}
@@ -222,7 +223,7 @@ func (p *connPool) tryClaim() net.Conn {
 		var claimed *poolEntry
 		for i, e := range p.entries {
 			if atomic.LoadInt32(&e.dead) == 0 {
-				p.entries = append(p.entries[:i], p.entries[i+1:]...)
+				p.entries = slices.Delete(p.entries, i, i+1)
 				close(e.cancel)
 				claimed = e
 				break
@@ -519,16 +520,10 @@ func agentWorker(serverAddr, targetAddr string, spawn chan<- struct{}, tlsConf *
 	}
 	setKeepalive(targetConn)
 
-	// write first chunk to target
-	if _, err := targetConn.Write(buf[:n]); err != nil {
-		log.Printf("[agent-%d] failed to write to target: %v", id, err)
-		serverConn.Close()
-		targetConn.Close()
-		return
-	}
-
 	log.Printf("[agent-%d] relay started: server <-> %s", id, targetAddr)
-	relay(serverConn, targetConn)
+	// Include the activation bytes in relay so even the first target write is
+	// interrupted if the opposite direction fails or finishes draining.
+	relay(&readerConn{Conn: serverConn, reader: io.MultiReader(bytes.NewReader(buf[:n]), serverConn)}, targetConn)
 	log.Printf("[agent-%d] relay ended", id)
 }
 
@@ -549,32 +544,6 @@ func dialRetry(addr string, id uint64) net.Conn {
 }
 
 // ======================== common ========================
-
-func relay(c1, c2 net.Conn) {
-	done := make(chan struct{}, 2)
-
-	pipe := func(dst, src net.Conn) {
-		io.Copy(dst, src)
-		if cw, ok := dst.(interface{ CloseWrite() error }); ok {
-			cw.CloseWrite()
-		}
-		done <- struct{}{}
-	}
-
-	go pipe(c1, c2)
-	go pipe(c2, c1)
-
-	<-done // first direction finished
-
-	// give the other direction up to 30s to finish
-	c1.SetReadDeadline(time.Now().Add(30 * time.Second))
-	c2.SetReadDeadline(time.Now().Add(30 * time.Second))
-
-	<-done // second direction finished
-
-	c1.Close()
-	c2.Close()
-}
 
 func setKeepalive(c net.Conn) {
 	if tc, ok := c.(*net.TCPConn); ok {

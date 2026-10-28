@@ -11,6 +11,27 @@ import (
 	"github.com/threatexpert/gonc/v2/netx"
 )
 
+// Keep gonc's tcp://target and OK/ERROR wire protocol, but use the shared relay
+// so stalled writes and half-close cleanup have the same bounds on every path.
+func serveTCPTunnel(tunnel net.Conn, target string) {
+	log.Printf("TCP-Connect: %s", target)
+	tunnel.SetDeadline(time.Now().Add(30 * time.Second))
+	dialer := net.Dialer{Timeout: 25 * time.Second}
+	conn, err := dialer.Dial("tcp", target)
+	if err != nil {
+		writeAll(tunnel, []byte(fmt.Sprintf("ERROR: %v\n", err)))
+		return
+	}
+	defer conn.Close()
+	setKeepalive(conn)
+	if err := writeAll(tunnel, []byte("OK\n")); err != nil {
+		return
+	}
+	tunnel.SetDeadline(time.Time{})
+	relay(conn, tunnel)
+	log.Printf("TCP relay for %s ended.", target)
+}
+
 // The same target-bearing tunnel serves HTTP and raw TCP forward entries.
 // ReadString stops exactly at the newline, preserving a target's early banner.
 func openTCPTunnel(tunnel net.Conn, target string) error {

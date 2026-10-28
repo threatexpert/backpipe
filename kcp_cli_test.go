@@ -2,9 +2,41 @@ package main
 
 import (
 	"io"
+	"strconv"
 	"strings"
 	"testing"
 )
+
+func TestKCPCLIWindows(t *testing.T) {
+	for _, role := range []string{"server", "agent"} {
+		base, option := []string{"-listen", "socks5://:1080"}, "-accept"
+		if role == "agent" {
+			base, option = nil, "-connect"
+		}
+		args := append(append([]string{}, base...), option, "kcp+dtls://127.0.0.1:10086?psk=key")
+		cfg, err := parseCommand(role, args, io.Discard)
+		if err != nil || cfg.kcp.SendWindow != 128 || cfg.kcp.ReceiveWindow != 128 {
+			t.Fatalf("%s changed window defaults: %v", role, err)
+		}
+		for _, size := range []int{128, 1024, 4096} {
+			cfg, err := parseCommand(role, append(args, "-kcp-sndwnd", strconv.Itoa(size), "-kcp-rcvwnd", "512"), io.Discard)
+			if err != nil || cfg.kcp.SendWindow != size || cfg.kcp.ReceiveWindow != 512 {
+				t.Fatalf("%s independent windows %d/512: %v", role, size, err)
+			}
+		}
+		for _, flag := range []string{"-kcp-sndwnd", "-kcp-rcvwnd"} {
+			for _, size := range []string{"-1", "0", "127", "4097", "2147483647"} {
+				if _, err := parseCommand(role, append(args, flag, size), io.Discard); err == nil {
+					t.Fatalf("%s accepted %s=%s", role, flag, size)
+				}
+			}
+			legacy := append(append([]string{}, base...), option, "tcp://127.0.0.1:10086", flag, "128")
+			if _, err := parseCommand(role, legacy, io.Discard); err == nil {
+				t.Fatalf("%s accepted %s without KCP", role, flag)
+			}
+		}
+	}
+}
 
 func TestKCPCLICombinations(t *testing.T) {
 	for _, role := range []string{"server", "agent"} {

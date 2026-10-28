@@ -20,6 +20,9 @@ func TestKCPDTLSPoolAndCoexistence(t *testing.T) {
 			args := []string{"server", "-listen", "socks5://127.0.0.1:0", "-listen", "tcp://127.0.0.1:0?to=" + target,
 				"-listen", "udp://127.0.0.1:0?to=" + udpTarget.String(), "-accept", "kcp+dtls://127.0.0.1:0?psk=" + key,
 				"-kcp-heartbeat", "100ms", "-kcp-timeout", "1s"}
+			if mode == "kcp-only" {
+				args = append(args, "-kcp-sndwnd", "1024", "-kcp-rcvwnd", "1024")
+			}
 			if mode != "kcp-only" {
 				args = append(args, "-accept", "dtls://127.0.0.1:0?psk="+key)
 			}
@@ -30,6 +33,9 @@ func TestKCPDTLSPoolAndCoexistence(t *testing.T) {
 			entries := entryAddresses(t, server, 3)
 			agentArgs := []string{"agent", "-connect", "kcp+dtls://" + listenerAddress(t, server, "agent") + "?psk=" + key,
 				"-pool", "1", "-kcp-heartbeat", "100ms", "-kcp-timeout", "1s"}
+			if mode == "kcp-only" {
+				agentArgs = append(agentArgs, "-kcp-sndwnd", "1024", "-kcp-rcvwnd", "1024")
+			}
 			if mode != "kcp-only" {
 				agentArgs = append(agentArgs, "-connect", "dtls://"+listenerAddress(t, server, "UDP agent")+"?psk="+key, "-udp-pool", "1")
 			}

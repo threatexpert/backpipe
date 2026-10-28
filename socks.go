@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -60,36 +61,25 @@ func (c *readerConn) CloseWrite() error {
 func serveProxyTunnel(c net.Conn, options *proxyOptions, redirects redirectRules) {
 	defer c.Close()
 	c.SetReadDeadline(time.Now().Add(30 * time.Second))
-	reader := bufio.NewReader(c)
-	prefix, err := reader.Peek(6)
+	c = &readerConn{Conn: c, reader: bufio.NewReader(c)}
+	line, err := netx.ReadString(c, '\n', 1024)
 	if err != nil {
 		return
 	}
-	c = &readerConn{Conn: c, reader: reader}
-	if string(prefix) != apps.TUNNEL_REQ_UDP {
-		if len(redirects) != 0 && string(prefix) == apps.TUNNEL_REQ_TCP {
-			line, err := netx.ReadString(c, '\n', 1024)
-			if err != nil {
-				return
-			}
-			original := strings.TrimPrefix(strings.TrimSpace(line), apps.TUNNEL_REQ_TCP)
-			target := redirects.rewrite("tcp", original)
-			if target != original {
-				line = apps.TUNNEL_REQ_TCP + target + "\n"
-			}
-			// Replay the request for gonc, preserving buffered payload and half-close.
-			c = &readerConn{Conn: c, reader: io.MultiReader(strings.NewReader(line), c)}
-		}
-		apps.ServeTunnelConn(&options.config, c)
-		return
-	}
-	if _, err := netx.ReadString(c, '\n', 1024); err != nil {
-		return
-	}
 	c.SetReadDeadline(time.Time{})
-	// Keep UDP lifecycle management local: the pinned gonc UDP handler has an
-	// unmatched WaitGroup.Add and cannot finish after its forwarding loops stop.
-	serveUDPTunnel(c, options.udpTimeout, redirects)
+	line = strings.TrimSpace(line)
+	switch {
+	case strings.HasPrefix(line, apps.TUNNEL_REQ_TCP):
+		target := redirects.rewrite("tcp", strings.TrimPrefix(line, apps.TUNNEL_REQ_TCP))
+		serveTCPTunnel(c, target)
+	case strings.HasPrefix(line, apps.TUNNEL_REQ_UDP):
+		// Keep UDP lifecycle management local: the pinned gonc UDP handler has
+		// an unmatched WaitGroup.Add and cannot finish after forwarding stops.
+		serveUDPTunnel(c, options.udpTimeout, redirects)
+	default:
+		c.SetWriteDeadline(time.Now().Add(30 * time.Second))
+		writeAll(c, []byte("ERROR: Unknown request type\n"))
+	}
 }
 
 func serveProxyClient(client net.Conn, pool *connPool, options *proxyOptions) {
@@ -156,8 +146,15 @@ func serveProxyClient(client net.Conn, pool *connPool, options *proxyOptions) {
 		serveUDPAssociation(client, tunnel, options, key)
 		return
 	}
+	if err := openTCPTunnel(tunnel, net.JoinHostPort(host, strconv.Itoa(port))); err != nil {
+		socksReply(client, 1, nil)
+		return
+	}
+	if err := socksReply(client, 0, nil); err != nil {
+		return
+	}
 	client.SetDeadline(time.Time{})
-	apps.ServeProxyOnTunnel(&options.config, client, key, tunnel, "CONNECT", host, port, nil)
+	relay(client, tunnel)
 }
 
 func socksAuthenticate(c net.Conn, username, password string) error {

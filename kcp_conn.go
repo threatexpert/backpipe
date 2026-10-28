@@ -33,12 +33,17 @@ var kcpMagic = []byte{'B', 'P', 'K', 1}
 
 type kcpSettings struct {
 	MTU                              int
+	SendWindow, ReceiveWindow        int
 	Heartbeat, Timeout, CloseTimeout time.Duration
 }
 
 func defaultKCPSettings() kcpSettings {
-	return kcpSettings{MTU: 1200, Heartbeat: 10 * time.Second, Timeout: 30 * time.Second, CloseTimeout: 5 * time.Second}
+	return kcpSettings{MTU: 1200, SendWindow: 128, ReceiveWindow: 128, Heartbeat: 10 * time.Second, Timeout: 30 * time.Second, CloseTimeout: 5 * time.Second}
 }
+
+// Keep the current 128-segment baseline as the minimum and bound per-session
+// memory exposure at the upper end.
+func validKCPWindow(n int) bool { return n >= 128 && n <= 4096 }
 
 // One authenticated DTLS connection belongs to one KCP session. Heartbeats and
 // FIN acknowledgments bypass KCP flow control, but never bypass DTLS. A stalled
@@ -247,7 +252,7 @@ type kcpStreamConn struct {
 }
 
 func newKCPStream(conn net.Conn, cfg kcpSettings) (*kcpStreamConn, error) {
-	if cfg.MTU < 576 || cfg.MTU > 1400 || cfg.Heartbeat <= 0 || cfg.Timeout < 3*cfg.Heartbeat || cfg.CloseTimeout <= 0 {
+	if cfg.MTU < 576 || cfg.MTU > 1400 || !validKCPWindow(cfg.SendWindow) || !validKCPWindow(cfg.ReceiveWindow) || cfg.Heartbeat <= 0 || cfg.Timeout < 3*cfg.Heartbeat || cfg.CloseTimeout <= 0 {
 		return nil, fmt.Errorf("invalid KCP settings")
 	}
 	p := &kcpPackets{conn: conn, cfg: cfg, done: make(chan struct{}), writeGate: make(chan struct{}, 1), lastPong: time.Now(), finAck: make(chan struct{})}
@@ -261,7 +266,7 @@ func newKCPStream(conn net.Conn, cfg kcpSettings) (*kcpStreamConn, error) {
 	}
 	sess.SetStreamMode(true)
 	sess.SetNoDelay(1, 20, 2, 0)
-	sess.SetWindowSize(128, 128)
+	sess.SetWindowSize(cfg.SendWindow, cfg.ReceiveWindow)
 	sess.SetACKNoDelay(true)
 	if !sess.SetMtu(cfg.MTU - datagramRecordOverhead - kcpEnvelopeSize) {
 		p.Close()

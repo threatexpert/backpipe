@@ -97,7 +97,7 @@ func runKCPAgent(ctx context.Context, ep endpoint, poolSize int, cfg kcpSettings
 	var workers, active sync.WaitGroup
 	stop := context.AfterFunc(ctx, sockets.closeAll)
 	defer stop()
-	log.Printf("[agent] KCP/DTLS server: %s, idle pool: %d", ep.address, poolSize)
+	log.Printf("[agent] KCP/DTLS server: %s, idle pool: %d, sndwnd=%d rcvwnd=%d", ep.address, poolSize, cfg.SendWindow, cfg.ReceiveWindow)
 	for i := 0; i < poolSize; i++ {
 		workers.Add(1)
 		go func(slot int) {
@@ -168,10 +168,7 @@ func runKCPAgent(ctx context.Context, ep endpoint, poolSize int, cfg kcpSettings
 					}
 					defer dst.Close()
 					setKeepalive(dst)
-					if err := writeAll(dst, buf[:n]); err != nil {
-						return
-					}
-					relay(stream, dst)
+					relay(&readerConn{Conn: stream, reader: io.MultiReader(bytes.NewReader(buf[:n]), stream)}, dst)
 				}()
 			}
 		}(i + 1)

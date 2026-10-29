@@ -12,8 +12,10 @@ import (
 )
 
 func TestKCPDTLSPoolAndCoexistence(t *testing.T) {
-	for _, mode := range []string{"kcp-only", "native-udp", "forced-stream"} {
+	for _, mode := range []string{"kcp-only", "native-udp", "forced-stream", "fec-only", "fec-native-udp"} {
 		t.Run(mode, func(t *testing.T) {
+			native := mode == "native-udp" || mode == "forced-stream" || mode == "fec-native-udp"
+			fec := strings.HasPrefix(mode, "fec-")
 			key := "kcp-integration-key"
 			target := tcpEcho(t, false)
 			udpTarget := udpEcho(t)
@@ -23,7 +25,10 @@ func TestKCPDTLSPoolAndCoexistence(t *testing.T) {
 			if mode == "kcp-only" {
 				args = append(args, "-kcp-sndwnd", "1024", "-kcp-rcvwnd", "1024")
 			}
-			if mode != "kcp-only" {
+			if fec {
+				args = append(args, "-kcp-fec", "10:3")
+			}
+			if native {
 				args = append(args, "-accept", "dtls://127.0.0.1:0?psk="+key)
 			}
 			if mode == "forced-stream" {
@@ -36,7 +41,10 @@ func TestKCPDTLSPoolAndCoexistence(t *testing.T) {
 			if mode == "kcp-only" {
 				agentArgs = append(agentArgs, "-kcp-sndwnd", "1024", "-kcp-rcvwnd", "1024")
 			}
-			if mode != "kcp-only" {
+			if fec {
+				agentArgs = append(agentArgs, "-kcp-fec", "10:3")
+			}
+			if native {
 				agentArgs = append(agentArgs, "-connect", "dtls://"+listenerAddress(t, server, "UDP agent")+"?psk="+key, "-udp-pool", "1")
 			}
 			agent := startProcess(t, agentArgs...)
@@ -94,7 +102,7 @@ func TestKCPDTLSPoolAndCoexistence(t *testing.T) {
 			}
 			forwardUDPRoundTrip(t, u, fixedUDP, []byte("fixed-udp"))
 			want := "transport=kcp+dtls"
-			if mode == "native-udp" {
+			if mode == "native-udp" || mode == "fec-native-udp" {
 				want = "transport=dtls"
 			}
 			if !strings.Contains(server.logs.String(), want) {

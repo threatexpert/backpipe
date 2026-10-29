@@ -64,7 +64,7 @@ func runConfiguredServer(c *commandConfig) error {
 	finished := make(chan error, len(listeners)+1)
 	if streamLn != nil {
 		if c.tunnel.scheme == "kcp+dtls" {
-			log.Printf("[server] agent pool: KCP over DTLS 1.2 with PSK mutual authentication, mtu=%d sndwnd=%d rcvwnd=%d heartbeat=%s timeout=%s", c.kcp.MTU, c.kcp.SendWindow, c.kcp.ReceiveWindow, c.kcp.Heartbeat, c.kcp.Timeout)
+			log.Printf("[server] agent pool: KCP over DTLS 1.2 with PSK mutual authentication, mtu=%d sndwnd=%d rcvwnd=%d nocwnd=%t fec=%s heartbeat=%s timeout=%s", c.kcp.MTU, c.kcp.SendWindow, c.kcp.ReceiveWindow, c.kcp.NoCongestion, c.kcp.fecProfile(), c.kcp.Heartbeat, c.kcp.Timeout)
 		} else if tlsConf != nil {
 			log.Printf("[server] agent pool: TLS 1.2-1.3 with PSK mutual authentication")
 		}

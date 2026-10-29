@@ -7,6 +7,37 @@ import (
 	"testing"
 )
 
+func TestKCPCLICongestionAndFEC(t *testing.T) {
+	for _, role := range []string{"server", "agent"} {
+		base, option := []string{"-listen", "socks5://:1080"}, "-accept"
+		if role == "agent" {
+			base, option = nil, "-connect"
+		}
+		args := append(append([]string{}, base...), option, "kcp+dtls://127.0.0.1:10086?psk=key")
+		cfg, err := parseCommand(role, args, io.Discard)
+		if err != nil || !cfg.kcp.NoCongestion || cfg.kcp.fecProfile() != "off" {
+			t.Fatalf("%s defaults: %v", role, err)
+		}
+		for _, profile := range []string{"off", "10:3", "4:2", "1:1", "32:32"} {
+			cfg, err := parseCommand(role, append(args, "-kcp-nocwnd=false", "-kcp-fec", profile), io.Discard)
+			if err != nil || cfg.kcp.NoCongestion || cfg.kcp.fecProfile() != profile {
+				t.Fatalf("%s profile %s: %v", role, profile, err)
+			}
+		}
+		for _, profile := range []string{"", "10", "10+3", "0:0", "0:3", "10:0", "-1:3", "33:3", "10:33", "10:3:1", "x:y", "999999999999999999999:3"} {
+			if _, err := parseCommand(role, append(args, "-kcp-fec", profile), io.Discard); err == nil {
+				t.Fatalf("%s accepted invalid FEC %q", role, profile)
+			}
+		}
+		for _, extra := range [][]string{{"-kcp-nocwnd=false"}, {"-kcp-nocwnd=true"}, {"-kcp-fec", "off"}, {"-kcp-fec", "10:3"}} {
+			legacy := append(append([]string{}, base...), option, "tcp://127.0.0.1:10086")
+			if _, err := parseCommand(role, append(legacy, extra...), io.Discard); err == nil {
+				t.Fatalf("%s accepted KCP options without KCP: %v", role, extra)
+			}
+		}
+	}
+}
+
 func TestKCPCLIWindows(t *testing.T) {
 	for _, role := range []string{"server", "agent"} {
 		base, option := []string{"-listen", "socks5://:1080"}, "-accept"

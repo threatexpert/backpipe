@@ -134,13 +134,19 @@ backpipe agent -connect "kcp+dtls://server_host:10086?psk=tunnel-key" \
 - agent 在空闲连接断开后按退避和抖动重连；活动会话在激活时就已补池。server 重启或网络恢复后，agent 重新建立会话。已中断的业务不会迁移或重放，新业务使用新连接。NAT 地址变化同样需要重建。
 - 接收缓存有上限，应用读取落后时由 KCP 流控产生背压。业务读写 deadline 可中断等待，部分接收帧在读超时后保留，避免超时破坏帧边界。
 
-`-kcp-mtu` 默认 `1200`，范围 `576..1400`，表示包含 DTLS 和 KCP 包装开销的外层 UDP 载荷预算，不含 IP/UDP 头；KCP 会进一步预留自己的包头。双方建议使用一致配置，当前不协商 MTU。`-udp-mtu` 仅控制原生 DTLS 池。KCP 启用拥塞控制和快速重传，不额外启用 FEC。`-kcp-*` 参数只在配置了 KCP 池时有效；心跳范围为 `50ms..1h`，超时须至少为心跳的三倍且不超过 `24h`。
+`-kcp-mtu` 默认 `1200`，范围 `576..1400`，表示包含 DTLS 和 KCP 包装开销的外层 UDP 载荷预算，不含 IP/UDP 头；KCP 会进一步预留自己的包头，启用 FEC 时也会预留纠错头及参数标记。双方建议使用一致配置，当前不协商 MTU。`-udp-mtu` 仅控制原生 DTLS 池。`-kcp-*` 参数只在配置了 KCP 池时有效；心跳范围为 `50ms..1h`，超时须至少为心跳的三倍且不超过 `24h`。
 
-`-kcp-sndwnd` 和 `-kcp-rcvwnd` 分别设置本端的发送、接收窗口，单位为 KCP 分段，默认均为 `128`，范围 `128..4096`。例如在 server 和 agent 命令后均添加 `-kcp-sndwnd 1024 -kcp-rcvwnd 1024`。两端可以不同，但每个方向仍受对端接收窗口及拥塞控制限制。增大窗口不会启动时就分配全部载荷缓存；高并发、丢包或接收端积压时，内存占用可能增加。未指定参数时保持原来的窗口设置。
+`-kcp-sndwnd` 和 `-kcp-rcvwnd` 分别设置本端的发送、接收窗口，单位为 KCP 分段，默认均为 `128`，范围 `128..4096`。例如在 server 和 agent 命令后均添加 `-kcp-sndwnd 1024 -kcp-rcvwnd 1024`。两端可以不同，每个方向受本端发送窗口、对端接收窗口及可选的拥塞控制限制。增大窗口不会启动时就分配全部载荷缓存；高并发、丢包或接收端积压时，内存占用可能增加。未指定参数时保持原来的窗口设置。
+
+从 **v1.6.0** 起，`-kcp-nocwnd` 默认为 `true`，关闭 KCP 拥塞控制，与 gonc 的快速模式一致，避免高延迟、丢包环境下拥塞窗口过小而限制吞吐。快速重传仍启用，接收流控和背压仍有效。设置 `-kcp-nocwnd=false` 可恢复 v1.5.0 的拥塞控制行为。此参数只影响本端发送，两端可以不同；关闭拥塞控制可能增加重传和带宽争用。
+
+`-kcp-fec` 默认 `off`。两端同时添加 `-kcp-fec 10:3` 可启用每 10 个数据分片附加 3 个纠错分片；也支持其他 `数据数:纠错数` 组合，每项范围 `1..32`。满组时，10:3 约增加 30% 分片流量及额外包头、计算开销；组内收到足够分片时可恢复丢失数据，超过纠错能力仍依靠 KCP 重传。低流量时不会为了凑齐 FEC 分组延迟数据发送。
+
+FEC 必须两端配置相同，当前不自动协商或回退。启用 FEC 的数据包携带认证后的参数标记；配置不匹配会在就绪前报告 `KCP FEC mismatch`。启用 FEC 要求双方均为 v1.6.0 或更新版本；旧版不认识 FEC 包，会拒绝会话。FEC 关闭时保留 v1.5.0 的 KCP 包格式，新旧两端可以互通。启动日志显示 `nocwnd` 和 `fec` 实际设置。
 
 所有 TCP 转发路径共用收尾逻辑：正常 EOF 发送半关闭，并给反向数据最多 30 秒排空；复制或半关闭出错则关闭两端。排空超时会中断读写并关闭连接，也覆盖阻塞的写入和半关闭操作，结束前等待转发协程退出。
 
-KCP 模式要求 server、agent 都升级到 v1.5.0。未使用 `kcp+dtls://` 时，TCP/TLS 与原生 DTLS 的线格式、认证、补池路径和默认传输选择保持不变；旧流式池不会增加 KCP 就绪帧、FIN 或心跳。
+基础 KCP 模式要求 server、agent 均为 v1.5.0 或更新版本，FEC 模式要求双方均为 v1.6.0 或更新版本。未使用 `kcp+dtls://` 时，TCP/TLS 与原生 DTLS 的线格式、认证、补池路径和默认传输选择保持不变；旧流式池不会增加 KCP 就绪帧、FIN 或心跳。
 
 ## 工作原理
 
@@ -444,6 +450,8 @@ agent 的回包处理仍是读取一个业务 UDP 包、写入隧道，再读取
 | `-kcp-mtu` | 两端 | `1200`；KCP/DTLS 外层 UDP 载荷预算，范围 `576..1400`；要求 KCP 池 |
 | `-kcp-sndwnd` | 两端 | `128`；本端 KCP 发送窗口，范围 `128..4096` 分段；要求 KCP 池 |
 | `-kcp-rcvwnd` | 两端 | `128`；本端 KCP 接收窗口，范围 `128..4096` 分段；要求 KCP 池 |
+| `-kcp-nocwnd` | 两端 | `true`；默认关闭 KCP 拥塞控制，`-kcp-nocwnd=false` 开启；只影响本端发送；要求 KCP 池 |
+| `-kcp-fec` | 两端 | `off`；可设 `10:3` 等 `数据数:纠错数`（每项 `1..32`）；两端必须一致；要求 KCP 池 |
 | `-kcp-heartbeat` | 两端 | `10s`；KCP/DTLS 心跳间隔；要求 KCP 池 |
 | `-kcp-timeout` | 两端 | `30s`；KCP/DTLS 有效心跳回复超时，至少为心跳的三倍；要求 KCP 池 |
 | `-redirect` | agent | 可重复；`[tcp://\|udp://]host:port=host:port`，默认同时匹配 TCP/UDP |
@@ -472,6 +480,8 @@ gonc 依赖固定到提交 `41d3f96c03fec9fbcf7ed9524b61792fca61ebee`，对应�
 测试覆盖真实 server/agent 进程、普通和加密多入口共享连接池、端口绑定失败回滚、gonc TCP/UDP 及 HTTP CONNECT 兼容、HTTP GET/POST 和 HTTPS 转发、PSK 拒绝、TLS 版本与套件协商、每会话 UDP 加密、SOCKS 认证、半关闭、空闲清理、断线重连、自动补池、固定目标转发，以及出站重定向、HTTP Host 保留和 UDP 实际回复来源。
 
 KCP 测试另外覆盖丢包、乱序、重复包、尾部数据与半关闭、关闭确认丢失、单向链路失效、背压与动态 deadline、协议错误、真实 DTLS 认证、agent 中断、server 重启补池、KCP 单独运行及与原生 DTLS 共存。可用 `go test -race . -run TestKCP` 执行 KCP 并发检查。
+
+v1.6.0 的测试还覆盖拥塞控制开关的实际发送行为、FEC 恢复计数、数据/纠错包 MTU 上限、FEC 参数不匹配拒绝，以及启用 FEC 的真实进程转发和补池。设置环境变量 `BACKPIPE_LEGACY_KCP_BINARY` 为单独编译的 v1.5.0 可执行文件路径后，运行 `go test -race . -run TestLegacyKCPBinaryCompatibility` 可检查不启用 FEC 时两个升级顺序下的 TCP 半关闭及 UDP 互通。
 
 升级兼容性测试可指定独立构建的 v1.4.2 程序：`BACKPIPE_LEGACY_BINARY=/absolute/path/to/backpipe-v1.4.2 go test . -run TestLegacyBinaryCompatibility`。测试覆盖新旧 server/agent 的两种搭配，以及 TCP、TLS、TLS 加原生 DTLS、仅原生 DTLS 四种配置；未指定旧程序时跳过此项。
 

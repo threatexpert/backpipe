@@ -13,12 +13,15 @@ import (
 	"time"
 )
 
-func testKCPPair(t *testing.T, hookA, hookB func([]byte) [][]byte) (*kcpStreamConn, *kcpStreamConn, *testRecordConn, *testRecordConn) {
+func testKCPPair(t *testing.T, hookA, hookB func([]byte) [][]byte, settings ...func(*kcpSettings)) (*kcpStreamConn, *kcpStreamConn, *testRecordConn, *testRecordConn) {
 	t.Helper()
 	a, b := newTestRecordPipe()
 	a.hook, b.hook = hookA, hookB
 	cfg := defaultKCPSettings()
 	cfg.Heartbeat, cfg.Timeout, cfg.CloseTimeout = 50*time.Millisecond, time.Second, time.Second
+	for _, configure := range settings {
+		configure(&cfg)
+	}
 	ca, err := newKCPStream(a, cfg)
 	if err != nil {
 		t.Fatal(err)

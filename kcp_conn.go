@@ -9,6 +9,8 @@ import (
 	"io"
 	"net"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,16 +19,17 @@ import (
 )
 
 const (
-	kcpEnvelopeSize      = 5
-	kcpFrameSize         = 16 << 10
-	kcpReceiveLimit      = 256 << 10
-	kcpPacketData   byte = 1
-	kcpPacketPing   byte = 2
-	kcpPacketPong   byte = 3
-	kcpPacketFINACK byte = 4
-	kcpFrameHello   byte = 1
-	kcpFrameData    byte = 2
-	kcpFrameFIN     byte = 3
+	kcpEnvelopeSize       = 5
+	kcpFrameSize          = 16 << 10
+	kcpReceiveLimit       = 256 << 10
+	kcpPacketData    byte = 1
+	kcpPacketPing    byte = 2
+	kcpPacketPong    byte = 3
+	kcpPacketFINACK  byte = 4
+	kcpPacketFECData byte = 5
+	kcpFrameHello    byte = 1
+	kcpFrameData     byte = 2
+	kcpFrameFIN      byte = 3
 )
 
 var kcpMagic = []byte{'B', 'P', 'K', 1}
@@ -34,11 +37,47 @@ var kcpMagic = []byte{'B', 'P', 'K', 1}
 type kcpSettings struct {
 	MTU                              int
 	SendWindow, ReceiveWindow        int
+	NoCongestion                     bool
+	FECData, FECParity               int
 	Heartbeat, Timeout, CloseTimeout time.Duration
 }
 
 func defaultKCPSettings() kcpSettings {
-	return kcpSettings{MTU: 1200, SendWindow: 128, ReceiveWindow: 128, Heartbeat: 10 * time.Second, Timeout: 30 * time.Second, CloseTimeout: 5 * time.Second}
+	return kcpSettings{MTU: 1200, SendWindow: 128, ReceiveWindow: 128, NoCongestion: true, Heartbeat: 10 * time.Second, Timeout: 30 * time.Second, CloseTimeout: 5 * time.Second}
+}
+
+func (cfg kcpSettings) validFEC() bool {
+	return (cfg.FECData == 0 && cfg.FECParity == 0) ||
+		(cfg.FECData >= 1 && cfg.FECData <= 32 && cfg.FECParity >= 1 && cfg.FECParity <= 32)
+}
+
+func (cfg kcpSettings) fecProfile() string {
+	if cfg.FECData == 0 && cfg.FECParity == 0 {
+		return "off"
+	}
+	return fmt.Sprintf("%d:%d", cfg.FECData, cfg.FECParity)
+}
+
+func (cfg *kcpSettings) setFEC(value string) error {
+	if value == "off" {
+		cfg.FECData, cfg.FECParity = 0, 0
+		return nil
+	}
+	data, parity, ok := strings.Cut(value, ":")
+	d, de := strconv.Atoi(data)
+	p, pe := strconv.Atoi(parity)
+	if !ok || de != nil || pe != nil || d < 1 || d > 32 || p < 1 || p > 32 {
+		return fmt.Errorf("-kcp-fec must be off or data:parity (each 1..32), for example 10:3")
+	}
+	cfg.FECData, cfg.FECParity = d, p
+	return nil
+}
+
+func (cfg kcpSettings) packetHeaderSize() int {
+	if cfg.FECData != 0 {
+		return kcpEnvelopeSize + 2 // authenticated FEC data/parity profile
+	}
+	return kcpEnvelopeSize
 }
 
 // Keep the current 128-segment baseline as the minimum and bound per-session
@@ -93,10 +132,17 @@ func (p *kcpPackets) send(kind byte, payload []byte) error {
 	case <-p.writeGate:
 	}
 	defer func() { p.writeGate <- struct{}{} }()
-	frame := make([]byte, kcpEnvelopeSize+len(payload))
+	headerSize := kcpEnvelopeSize
+	if kind == kcpPacketFECData {
+		headerSize += 2
+	}
+	frame := make([]byte, headerSize+len(payload))
 	copy(frame, kcpMagic)
 	frame[4] = kind
-	copy(frame[5:], payload)
+	if kind == kcpPacketFECData {
+		frame[5], frame[6] = byte(p.cfg.FECData), byte(p.cfg.FECParity)
+	}
+	copy(frame[headerSize:], payload)
 	p.conn.SetWriteDeadline(time.Now().Add(p.cfg.Timeout))
 	n, err := p.conn.Write(frame)
 	if err == nil && n != len(frame) {
@@ -123,7 +169,23 @@ func (p *kcpPackets) ReadFrom(b []byte) (int, net.Addr, error) {
 		}
 		payload := buf[5:n]
 		switch buf[4] {
-		case kcpPacketData:
+		case kcpPacketData, kcpPacketFECData:
+			// Plain records retain the v1.5.0 wire format. FEC records carry
+			// their profile so mismatched peers fail before feeding KCP's decoder.
+			if buf[4] == kcpPacketFECData {
+				if len(payload) < 2 {
+					p.fail(fmt.Errorf("truncated KCP FEC profile"))
+					return 0, nil, p.terminal()
+				}
+				if p.cfg.FECData == 0 || int(payload[0]) != p.cfg.FECData || int(payload[1]) != p.cfg.FECParity {
+					p.fail(fmt.Errorf("KCP FEC mismatch: local=%s peer=%d:%d", p.cfg.fecProfile(), payload[0], payload[1]))
+					return 0, nil, p.terminal()
+				}
+				payload = payload[2:]
+			} else if p.cfg.FECData != 0 {
+				p.fail(fmt.Errorf("KCP FEC mismatch: local=%s peer=off", p.cfg.fecProfile()))
+				return 0, nil, p.terminal()
+			}
 			if len(payload) > len(b) {
 				p.fail(io.ErrShortBuffer)
 				return 0, nil, io.ErrShortBuffer
@@ -165,10 +227,14 @@ func (p *kcpPackets) ReadFrom(b []byte) (int, net.Addr, error) {
 }
 
 func (p *kcpPackets) WriteTo(b []byte, _ net.Addr) (int, error) {
-	if len(b)+kcpEnvelopeSize+datagramRecordOverhead > p.cfg.MTU {
+	if len(b)+p.cfg.packetHeaderSize()+datagramRecordOverhead > p.cfg.MTU {
 		return 0, fmt.Errorf("KCP packet exceeds DTLS MTU")
 	}
-	if err := p.send(kcpPacketData, b); err != nil {
+	kind := kcpPacketData
+	if p.cfg.FECData != 0 {
+		kind = kcpPacketFECData
+	}
+	if err := p.send(kind, b); err != nil {
 		return 0, err
 	}
 	return len(b), nil
@@ -252,23 +318,28 @@ type kcpStreamConn struct {
 }
 
 func newKCPStream(conn net.Conn, cfg kcpSettings) (*kcpStreamConn, error) {
-	if cfg.MTU < 576 || cfg.MTU > 1400 || !validKCPWindow(cfg.SendWindow) || !validKCPWindow(cfg.ReceiveWindow) || cfg.Heartbeat <= 0 || cfg.Timeout < 3*cfg.Heartbeat || cfg.CloseTimeout <= 0 {
+	if cfg.MTU < 576 || cfg.MTU > 1400 || !validKCPWindow(cfg.SendWindow) || !validKCPWindow(cfg.ReceiveWindow) || !cfg.validFEC() || cfg.Heartbeat <= 0 || cfg.Timeout < 3*cfg.Heartbeat || cfg.CloseTimeout <= 0 {
 		return nil, fmt.Errorf("invalid KCP settings")
 	}
 	p := &kcpPackets{conn: conn, cfg: cfg, done: make(chan struct{}), writeGate: make(chan struct{}, 1), lastPong: time.Now(), finAck: make(chan struct{})}
 	p.writeGate <- struct{}{}
-	// DTLS already authenticates and encrypts every KCP packet. FEC is off;
-	// keep congestion control enabled rather than forcing unlimited sending.
-	sess, err := kcp.NewConn4(0, conn.RemoteAddr(), nil, 0, 0, true, p)
+	// DTLS already authenticates and encrypts every KCP/FEC packet.
+	sess, err := kcp.NewConn4(0, conn.RemoteAddr(), nil, cfg.FECData, cfg.FECParity, true, p)
 	if err != nil {
 		p.Close()
 		return nil, err
 	}
 	sess.SetStreamMode(true)
-	sess.SetNoDelay(1, 20, 2, 0)
+	nocwnd := 0
+	if cfg.NoCongestion {
+		nocwnd = 1
+	}
+	sess.SetNoDelay(1, 20, 2, nocwnd)
 	sess.SetWindowSize(cfg.SendWindow, cfg.ReceiveWindow)
 	sess.SetACKNoDelay(true)
-	if !sess.SetMtu(cfg.MTU - datagramRecordOverhead - kcpEnvelopeSize) {
+	// SetMtu already deducts kcp-go's FEC header (8 bytes when enabled).
+	// Reserve only our envelope and the DTLS record overhead here.
+	if !sess.SetMtu(cfg.MTU - datagramRecordOverhead - cfg.packetHeaderSize()) {
 		p.Close()
 		sess.Close()
 		return nil, fmt.Errorf("invalid KCP MTU")

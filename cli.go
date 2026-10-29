@@ -206,6 +206,8 @@ func parseCommand(role string, args []string, output io.Writer) (*commandConfig,
 	fs.IntVar(&c.kcp.MTU, "kcp-mtu", c.kcp.MTU, "maximum outer KCP/DTLS UDP payload (576..1400 bytes); requires kcp+dtls://")
 	fs.IntVar(&c.kcp.SendWindow, "kcp-sndwnd", c.kcp.SendWindow, "KCP send window (128..4096 segments); requires kcp+dtls://")
 	fs.IntVar(&c.kcp.ReceiveWindow, "kcp-rcvwnd", c.kcp.ReceiveWindow, "KCP receive window (128..4096 segments); requires kcp+dtls://")
+	fs.BoolVar(&c.kcp.NoCongestion, "kcp-nocwnd", c.kcp.NoCongestion, "disable KCP congestion control; use -kcp-nocwnd=false to enable; requires kcp+dtls://")
+	fs.Func("kcp-fec", "KCP FEC: off (default) or data:parity, e.g. 10:3 (each 1..32); must match on both peers; requires kcp+dtls://", c.kcp.setFEC)
 	fs.DurationVar(&c.kcp.Heartbeat, "kcp-heartbeat", c.kcp.Heartbeat, "KCP/DTLS heartbeat interval; requires kcp+dtls://")
 	fs.DurationVar(&c.kcp.Timeout, "kcp-timeout", c.kcp.Timeout, "KCP/DTLS peer response timeout (at least 3 heartbeat intervals); requires kcp+dtls://")
 	fs.Usage = func() {
@@ -252,7 +254,7 @@ func parseCommand(role string, args []string, output io.Writer) (*commandConfig,
 		}
 		c.tunnels = append(c.tunnels, ep)
 	}
-	if c.tunnel.scheme != "kcp+dtls" && (specified["kcp-mtu"] || specified["kcp-sndwnd"] || specified["kcp-rcvwnd"] || specified["kcp-heartbeat"] || specified["kcp-timeout"]) {
+	if c.tunnel.scheme != "kcp+dtls" && (specified["kcp-mtu"] || specified["kcp-sndwnd"] || specified["kcp-rcvwnd"] || specified["kcp-nocwnd"] || specified["kcp-fec"] || specified["kcp-heartbeat"] || specified["kcp-timeout"]) {
 		return nil, fmt.Errorf("KCP options require a kcp+dtls:// pool endpoint")
 	}
 	if !validKCPWindow(c.kcp.SendWindow) || !validKCPWindow(c.kcp.ReceiveWindow) {

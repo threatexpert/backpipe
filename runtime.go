@@ -25,13 +25,25 @@ func runConfiguredServer(c *commandConfig) error {
 			streamPool.close()
 		}
 		if datagramLn != nil {
-			datagramLn.Close()
+			if !c.sharedDTLS {
+				datagramLn.Close()
+			}
 			udpPool.close()
 		}
 	}()
 	for _, ep := range c.tunnels {
 		var err error
-		if ep.scheme == "dtls" {
+		if c.sharedDTLS {
+			// The implicit native endpoint follows the KCP endpoint. One
+			// authenticated listener dispatches records into two separate pools.
+			if ep.scheme == "dtls" {
+				continue
+			}
+			streamPool, udpPool = newConnPool(), newDatagramPool()
+			// Handshake fragmentation must fit both configured carrier budgets.
+			streamLn, err = listenDTLSPool(ep, min(c.kcp.MTU, c.udpMTU))
+			datagramLn = streamLn
+		} else if ep.scheme == "dtls" {
 			udpPool = newDatagramPool()
 			datagramLn, err = listenDTLSPool(ep, c.udpMTU)
 		} else if ep.scheme == "kcp+dtls" {
@@ -61,15 +73,19 @@ func runConfiguredServer(c *commandConfig) error {
 		}
 	}()
 	whitelist := parseWhitelist(c.allow)
-	finished := make(chan error, len(listeners)+1)
+	finished := make(chan error, len(listeners)+2)
 	if streamLn != nil {
 		if c.tunnel.scheme == "kcp+dtls" {
-			log.Printf("[server] agent pool: KCP over DTLS 1.2 with PSK mutual authentication, mtu=%d sndwnd=%d rcvwnd=%d nocwnd=%t fec=%s heartbeat=%s timeout=%s", c.kcp.MTU, c.kcp.SendWindow, c.kcp.ReceiveWindow, c.kcp.NoCongestion, c.kcp.fecProfile(), c.kcp.Heartbeat, c.kcp.Timeout)
+			log.Printf("[server] agent pool: KCP over DTLS 1.2 with PSK mutual authentication, mtu=%d sndwnd=%d rcvwnd=%d nocwnd=%t ack-nodelay=%t fec=%s heartbeat=%s timeout=%s", c.kcp.MTU, c.kcp.SendWindow, c.kcp.ReceiveWindow, c.kcp.NoCongestion, c.kcp.ACKNoDelay, c.kcp.fecProfile(), c.kcp.Heartbeat, c.kcp.Timeout)
 		} else if tlsConf != nil {
 			log.Printf("[server] agent pool: TLS 1.2-1.3 with PSK mutual authentication")
 		}
 		log.Printf("[server] waiting for agent connections on %s", streamLn.Addr())
-		if c.tunnel.scheme == "kcp+dtls" {
+		if c.sharedDTLS {
+			go func() {
+				finished <- acceptSharedDTLSPoolConns(ctx, streamLn, streamPool, udpPool, whitelist, c.kcp, c.udpMTU)
+			}()
+		} else if c.tunnel.scheme == "kcp+dtls" {
 			go func() { finished <- acceptKCPPoolConns(ctx, streamLn, streamPool, whitelist, c.kcp) }()
 		} else {
 			go acceptPoolConns(streamLn, streamPool, whitelist, tlsConf)
@@ -77,7 +93,11 @@ func runConfiguredServer(c *commandConfig) error {
 	}
 	if datagramLn != nil {
 		log.Printf("[server] waiting for UDP agent connections on %s (DTLS 1.2, PSK mutual authentication, mtu=%d)", datagramLn.Addr(), c.udpMTU)
-		go func() { finished <- acceptDTLSPoolConns(ctx, datagramLn, udpPool, whitelist, c.udpMTU) }()
+		if c.sharedDTLS {
+			log.Printf("[server] KCP and native UDP pools share one authenticated DTLS listener")
+		} else {
+			go func() { finished <- acceptDTLSPoolConns(ctx, datagramLn, udpPool, whitelist, c.udpMTU) }()
+		}
 	}
 	go statusTickerPools(ctx, streamPool, udpPool)
 	for i, ln := range listeners {

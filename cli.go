@@ -34,8 +34,8 @@ Usage:
   backpipe server -listen socks5://:1080 -accept "kcp+dtls://:10086?psk=tunnel-key"
   backpipe agent -connect "kcp+dtls://server_host:10086?psk=tunnel-key" -pool 20
 
-  backpipe server -listen socks5://:1080 -accept "kcp+dtls://:10086?psk=tunnel-key" -accept "dtls://:10087?psk=tunnel-key"
-  backpipe agent -connect "kcp+dtls://server_host:10086?psk=tunnel-key" -connect "dtls://server_host:10087?psk=tunnel-key" -pool 20 -udp-pool 20
+  backpipe server -listen socks5://:1080 -accept "kcp+dtls://:10086?psk=tunnel-key" -kcp-native-udp
+  backpipe agent -connect "kcp+dtls://server_host:10086?psk=tunnel-key" -kcp-native-udp -pool 20 -udp-pool 20
 
   backpipe server -listen tcp://:8080 -accept :10086
   backpipe agent -connect server_host:10086 -target 127.0.0.1:80
@@ -155,6 +155,7 @@ type commandConfig struct {
 	udpTransport   string
 	udpMTU         int
 	kcp            kcpSettings
+	sharedDTLS     bool
 	allow          string
 	ppv2           bool
 	proxy          *proxyOptions
@@ -195,18 +196,20 @@ func parseCommand(role string, args []string, output io.Writer) (*commandConfig,
 		})
 		fs.StringVar(&target, "target", "", "fixed TCP target for bare tcp:// listeners; omit for SOCKS5/HTTP and listeners with ?to=host:port")
 		fs.IntVar(&c.pool, "pool", 5, "desired idle TCP/TLS or KCP/DTLS streams; active sessions are additional")
-		fs.IntVar(&c.udpPool, "udp-pool", 20, "desired idle DTLS sessions; requires dtls://; active sessions are additional")
+		fs.IntVar(&c.udpPool, "udp-pool", 20, "desired idle native DTLS sessions; requires dtls:// or -kcp-native-udp; active sessions are additional")
 		fs.Func("redirect", "outbound target rewrite (repeatable): [tcp://|udp://]host:port=host:port; no protocol matches both", func(value string) error {
 			redirects = append(redirects, value)
 			return nil
 		})
 	}
 	fs.DurationVar(&idle, "udp-timeout", 2*time.Minute, "UDP idle timeout for SOCKS5 and fixed forwarding; set on both peers")
-	fs.IntVar(&c.udpMTU, "udp-mtu", defaultDatagramMTU, fmt.Sprintf("maximum outer UDP payload in bytes (%d..%d); requires dtls://; set on both peers", minDatagramMTU, maxDatagramMTU))
+	fs.IntVar(&c.udpMTU, "udp-mtu", defaultDatagramMTU, fmt.Sprintf("maximum outer UDP payload in bytes (%d..%d); requires dtls:// or -kcp-native-udp; set on both peers", minDatagramMTU, maxDatagramMTU))
 	fs.IntVar(&c.kcp.MTU, "kcp-mtu", c.kcp.MTU, "maximum outer KCP/DTLS UDP payload (576..1400 bytes); requires kcp+dtls://")
 	fs.IntVar(&c.kcp.SendWindow, "kcp-sndwnd", c.kcp.SendWindow, "KCP send window (128..4096 segments); requires kcp+dtls://")
 	fs.IntVar(&c.kcp.ReceiveWindow, "kcp-rcvwnd", c.kcp.ReceiveWindow, "KCP receive window (128..4096 segments); requires kcp+dtls://")
 	fs.BoolVar(&c.kcp.NoCongestion, "kcp-nocwnd", c.kcp.NoCongestion, "disable KCP congestion control; use -kcp-nocwnd=false to enable; requires kcp+dtls://")
+	fs.BoolVar(&c.kcp.ACKNoDelay, "kcp-ack-nodelay", c.kcp.ACKNoDelay, "send KCP ACKs immediately instead of batching on the 20ms update cycle; requires kcp+dtls://")
+	fs.BoolVar(&c.sharedDTLS, "kcp-native-udp", false, "also establish a native UDP/DTLS pool on the same KCP address and PSK; set on both peers; no second endpoint required")
 	fs.Func("kcp-fec", "KCP FEC: off (default) or data:parity, e.g. 10:3 (each 1..32); must match on both peers; requires kcp+dtls://", c.kcp.setFEC)
 	fs.DurationVar(&c.kcp.Heartbeat, "kcp-heartbeat", c.kcp.Heartbeat, "KCP/DTLS heartbeat interval; requires kcp+dtls://")
 	fs.DurationVar(&c.kcp.Timeout, "kcp-timeout", c.kcp.Timeout, "KCP/DTLS peer response timeout (at least 3 heartbeat intervals); requires kcp+dtls://")
@@ -254,8 +257,17 @@ func parseCommand(role string, args []string, output io.Writer) (*commandConfig,
 		}
 		c.tunnels = append(c.tunnels, ep)
 	}
-	if c.tunnel.scheme != "kcp+dtls" && (specified["kcp-mtu"] || specified["kcp-sndwnd"] || specified["kcp-rcvwnd"] || specified["kcp-nocwnd"] || specified["kcp-fec"] || specified["kcp-heartbeat"] || specified["kcp-timeout"]) {
+	if c.tunnel.scheme != "kcp+dtls" && (specified["kcp-mtu"] || specified["kcp-sndwnd"] || specified["kcp-rcvwnd"] || specified["kcp-nocwnd"] || specified["kcp-ack-nodelay"] || specified["kcp-native-udp"] || specified["kcp-fec"] || specified["kcp-heartbeat"] || specified["kcp-timeout"]) {
 		return nil, fmt.Errorf("KCP options require a kcp+dtls:// pool endpoint")
+	}
+	if c.sharedDTLS {
+		if hasDTLS {
+			return nil, fmt.Errorf("-kcp-native-udp uses the KCP endpoint; do not also specify a dtls:// endpoint")
+		}
+		native := c.tunnel
+		native.scheme = "dtls"
+		c.tunnels = append(c.tunnels, native)
+		hasDTLS = true
 	}
 	if !validKCPWindow(c.kcp.SendWindow) || !validKCPWindow(c.kcp.ReceiveWindow) {
 		return nil, fmt.Errorf("-kcp-sndwnd and -kcp-rcvwnd must be between 128 and 4096 segments")
@@ -263,7 +275,7 @@ func parseCommand(role string, args []string, output io.Writer) (*commandConfig,
 	if c.kcp.MTU < 576 || c.kcp.MTU > 1400 || c.kcp.Heartbeat < 50*time.Millisecond || c.kcp.Heartbeat > time.Hour || c.kcp.Timeout < 3*c.kcp.Heartbeat || c.kcp.Timeout > 24*time.Hour {
 		return nil, fmt.Errorf("KCP requires MTU 576..1400, heartbeat 50ms..1h, timeout at least 3 heartbeats and at most 24h")
 	}
-	if c.tunnel.scheme == "kcp+dtls" && hasDTLS {
+	if c.tunnel.scheme == "kcp+dtls" && hasDTLS && !c.sharedDTLS {
 		for _, ep := range c.tunnels {
 			if ep.scheme == "dtls" {
 				_, kp, _ := net.SplitHostPort(c.tunnel.address)
@@ -271,13 +283,13 @@ func parseCommand(role string, args []string, output io.Writer) (*commandConfig,
 				kn, _ := strconv.Atoi(kp)
 				dn, _ := strconv.Atoi(dp)
 				if kn == dn && kn != 0 {
-					return nil, fmt.Errorf("KCP/DTLS and native DTLS require different UDP ports")
+					return nil, fmt.Errorf("use -kcp-native-udp without a dtls:// endpoint to share the KCP UDP port")
 				}
 			}
 		}
 	}
 	if !hasDTLS && (specified["udp-pool"] || specified["udp-mtu"]) {
-		return nil, fmt.Errorf("-udp-pool and -udp-mtu require a DTLS pool endpoint")
+		return nil, fmt.Errorf("-udp-pool and -udp-mtu require a DTLS pool endpoint or -kcp-native-udp")
 	}
 	if c.udpPool < 1 {
 		return nil, fmt.Errorf("-udp-pool must be at least 1")

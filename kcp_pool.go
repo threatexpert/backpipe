@@ -97,7 +97,7 @@ func runKCPAgent(ctx context.Context, ep endpoint, poolSize int, cfg kcpSettings
 	var workers, active sync.WaitGroup
 	stop := context.AfterFunc(ctx, sockets.closeAll)
 	defer stop()
-	log.Printf("[agent] KCP/DTLS server: %s, idle pool: %d, sndwnd=%d rcvwnd=%d nocwnd=%t fec=%s", ep.address, poolSize, cfg.SendWindow, cfg.ReceiveWindow, cfg.NoCongestion, cfg.fecProfile())
+	log.Printf("[agent] KCP/DTLS server: %s, idle pool: %d, sndwnd=%d rcvwnd=%d nocwnd=%t ack-nodelay=%t fec=%s", ep.address, poolSize, cfg.SendWindow, cfg.ReceiveWindow, cfg.NoCongestion, cfg.ACKNoDelay, cfg.fecProfile())
 	for i := 0; i < poolSize; i++ {
 		workers.Add(1)
 		go func(slot int) {

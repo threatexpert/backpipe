@@ -15,8 +15,14 @@ func TestKCPCLICongestionAndFEC(t *testing.T) {
 		}
 		args := append(append([]string{}, base...), option, "kcp+dtls://127.0.0.1:10086?psk=key")
 		cfg, err := parseCommand(role, args, io.Discard)
-		if err != nil || !cfg.kcp.NoCongestion || cfg.kcp.fecProfile() != "off" {
+		if err != nil || !cfg.kcp.NoCongestion || cfg.kcp.ACKNoDelay || cfg.kcp.fecProfile() != "off" {
 			t.Fatalf("%s defaults: %v", role, err)
+		}
+		for _, immediate := range []bool{false, true} {
+			cfg, err := parseCommand(role, append(args, "-kcp-ack-nodelay="+strconv.FormatBool(immediate)), io.Discard)
+			if err != nil || cfg.kcp.ACKNoDelay != immediate {
+				t.Fatalf("%s ACK mode %t: %v", role, immediate, err)
+			}
 		}
 		for _, profile := range []string{"off", "10:3", "4:2", "1:1", "32:32"} {
 			cfg, err := parseCommand(role, append(args, "-kcp-nocwnd=false", "-kcp-fec", profile), io.Discard)
@@ -29,7 +35,7 @@ func TestKCPCLICongestionAndFEC(t *testing.T) {
 				t.Fatalf("%s accepted invalid FEC %q", role, profile)
 			}
 		}
-		for _, extra := range [][]string{{"-kcp-nocwnd=false"}, {"-kcp-nocwnd=true"}, {"-kcp-fec", "off"}, {"-kcp-fec", "10:3"}} {
+		for _, extra := range [][]string{{"-kcp-nocwnd=false"}, {"-kcp-nocwnd=true"}, {"-kcp-ack-nodelay=false"}, {"-kcp-ack-nodelay=true"}, {"-kcp-fec", "off"}, {"-kcp-fec", "10:3"}} {
 			legacy := append(append([]string{}, base...), option, "tcp://127.0.0.1:10086")
 			if _, err := parseCommand(role, append(legacy, extra...), io.Discard); err == nil {
 				t.Fatalf("%s accepted KCP options without KCP: %v", role, extra)

@@ -113,18 +113,41 @@ backpipe agent -connect "kcp+dtls://server_host:10086?psk=tunnel-key" -pool 20 \
 
 此时所有 server-agent 业务均走 KCP/DTLS，只需为池入口开放 **UDP/10086**。客户端入口及目标仍使用其各自的 TCP/UDP 协议。KCP 与 TCP/TLS **互斥**，不能在同一进程中同时指定两种流式池，也没有自动回退。`-pool` 控制空闲 KCP 会话数量；每条业务独占一个会话，激活后补池，结束后关闭。裸 TCP 入口、agent `-target`、`-ppv2` 和 `-redirect` 同样适用。
 
-也可以保留独立的原生 UDP/DTLS 池，让 TCP/HTTP 走 KCP，UDP 业务继续使用不重传的数据报隧道：
+从 **v1.7.0** 起，两端添加 `-kcp-native-udp` 即可在同一端口建立独立的原生 UDP/DTLS 池，让 TCP/HTTP 走 KCP，UDP 业务使用不重传的数据报隧道：
 
 ```sh
 backpipe server -listen socks5://:1080 \
-  -accept "kcp+dtls://:10086?psk=tunnel-key" \
-  -accept "dtls://:10087?psk=tunnel-key"
+  -accept "kcp+dtls://:10086?psk=tunnel-key" -kcp-native-udp
 
 backpipe agent -connect "kcp+dtls://server_host:10086?psk=tunnel-key" \
-  -connect "dtls://server_host:10087?psk=tunnel-key" -pool 20 -udp-pool 20
+  -kcp-native-udp -pool 20 -udp-pool 20
 ```
 
-两种池都使用 UDP，必须配置**不同端口**，并分别开放防火墙。配置了原生 `dtls://` 时，UDP 业务默认选择原生 DTLS；server 添加 `-udp-transport stream` 可明确改为 KCP。旧的 `-udp-transport tcp` 是 `stream` 的兼容别名，表示当前流式池。KCP 承载 UDP 时会保留业务数据报边界，但 KCP 的重传会延迟同一会话中的后续数据报；需要保留 UDP 丢包语义时使用原生 DTLS。日志分别显示 `transport=kcp+dtls`、`transport=dtls`；`idle` 统计所选流式池，`udp-idle` 统计原生 DTLS 池。
+只需开放 **UDP/10086**，不添加第二个 `-accept`/`-connect`。两种池共用目的地址、端口和 PSK；agent 为各个会话使用独立 UDP socket，server 在 DTLS 双向认证后根据首个应用报文识别 KCP 或原生数据报协议。它们共用一个监听 socket，但不是同一个有序流；空闲池、业务会话和补池分别管理。`-pool` 控制 KCP 空闲会话数，`-udp-pool` 控制原生 DTLS 空闲会话数，`-udp-mtu` 仍只控制原生数据报预算。
+
+启用此开关时，UDP 业务默认选择原生 DTLS；server 添加 `-udp-transport stream` 可明确改为 KCP。旧的 `-udp-transport tcp` 是 `stream` 的兼容别名，表示当前流式池。KCP 承载 UDP 时会保留业务数据报边界，但 KCP 的重传会延迟同一会话中的后续数据报。日志分别显示 `transport=kcp+dtls`、`transport=dtls`；`idle` 统计流式池，`udp-idle` 统计原生 DTLS 池。
+
+`-kcp-native-udp` 默认关闭，要求 KCP 地址，不可与显式 `dtls://` 地址同时指定。使用此开关的 server 和 agent 均需升级到 v1.7.0；旧 server 不支持同端口分流。原来的 KCP 单池和显式独立 DTLS 地址配置仍兼容，线格式没有改变。
+
+#### 将 UDP/DNS 与 KCP 流式业务分开
+
+对于通过 SOCKS5 UDP ASSOCIATE 转发的 DNS，可启用同端口原生 DTLS 池，避免 DNS 等待同一 KCP 流的丢包重传。下面保留原端口 `10087`、窗口 `1500` 和 FEC `10:3`：
+
+```sh
+backpipe server -listen "socks5://127.0.0.1:10987" \
+  -accept "kcp+dtls://:10087?psk=@/root/vpn/linkpsk" \
+  -kcp-native-udp \
+  -kcp-sndwnd 1500 -kcp-rcvwnd 1500 -kcp-fec 10:3
+
+backpipe agent \
+  -connect "kcp+dtls://server_host:10087?psk=@/root/vpn/linkpsk" \
+  -kcp-native-udp -pool 20 -udp-pool 20 \
+  -kcp-sndwnd 1500 -kcp-rcvwnd 1500 -kcp-fec 10:3
+```
+
+替换 `server_host`，两端分别准备对应的密钥文件，只使用原有 **UDP/10087**。启用开关后，所有 UDP 代理和固定 UDP 转发默认走原生 DTLS；池不可用时会等待或失败，不会静默回退到 KCP。两端均需启用，否则无法同时建立两种池。可通过两种池日志中的相同监听地址，以及 UDP 业务日志中的 `transport=dtls` 确认生效。
+
+这是按业务传输类型分流，不解析 DNS 内容。DNS over TCP、DoT、DoH 仍走 KCP 流式池；客户端必须实际把 UDP DNS 交给 SOCKS5 UDP 代理。原生 DTLS 业务数据不重传，丢包时由 DNS 客户端负责重试。两个池仍共享物理网络带宽，分池不能解决 KCP 抢满链路所造成的排队；此示例也不表示窗口 1500 和 FEC 10:3 适合所有链路。
 
 连接管理与关闭行为：
 
@@ -140,9 +163,11 @@ backpipe agent -connect "kcp+dtls://server_host:10086?psk=tunnel-key" \
 
 从 **v1.6.0** 起，`-kcp-nocwnd` 默认为 `true`，关闭 KCP 拥塞控制，与 gonc 的快速模式一致，避免高延迟、丢包环境下拥塞窗口过小而限制吞吐。快速重传仍启用，接收流控和背压仍有效。设置 `-kcp-nocwnd=false` 可恢复 v1.5.0 的拥塞控制行为。此参数只影响本端发送，两端可以不同；关闭拥塞控制可能增加重传和带宽争用。
 
+从 **v1.7.0** 起，`-kcp-ack-nodelay` 默认 `false`，按 KCP 的 20ms 更新周期合并 ACK，减少小包和 DTLS 处理开销；设置 `-kcp-ack-nodelay=true` 恢复立即 ACK。合并可能增加 ACK 等待时间，实际延迟取决于调度和链路。此选项控制本端 ACK 发送，两端可以不同，不改变线格式，也不需要与旧端协商。心跳 pong 和 FINACK 不受此选项影响：接收循环只更新固定大小的待发送状态，发送端在下一次数据写入前处理一批控制回复，避免接收线程等待出口写入；已经阻塞的底层写操作仍受超时和关闭机制约束。每个会话复用接收缓冲区。
+
 `-kcp-fec` 默认 `off`。两端同时添加 `-kcp-fec 10:3` 可启用每 10 个数据分片附加 3 个纠错分片；也支持其他 `数据数:纠错数` 组合，每项范围 `1..32`。满组时，10:3 约增加 30% 分片流量及额外包头、计算开销；组内收到足够分片时可恢复丢失数据，超过纠错能力仍依靠 KCP 重传。低流量时不会为了凑齐 FEC 分组延迟数据发送。
 
-FEC 必须两端配置相同，当前不自动协商或回退。启用 FEC 的数据包携带认证后的参数标记；配置不匹配会在就绪前报告 `KCP FEC mismatch`。启用 FEC 要求双方均为 v1.6.0 或更新版本；旧版不认识 FEC 包，会拒绝会话。FEC 关闭时保留 v1.5.0 的 KCP 包格式，新旧两端可以互通。启动日志显示 `nocwnd` 和 `fec` 实际设置。
+FEC 必须两端配置相同，当前不自动协商或回退。启用 FEC 的数据包携带认证后的参数标记；配置不匹配会在就绪前报告 `KCP FEC mismatch`。启用 FEC 要求双方均为 v1.6.0 或更新版本；旧版不认识 FEC 包，会拒绝会话。FEC 关闭时保留 v1.5.0 的 KCP 包格式，新旧两端可以互通。启动日志显示 `nocwnd`、`ack-nodelay` 和 `fec` 实际设置。
 
 所有 TCP 转发路径共用收尾逻辑：正常 EOF 发送半关闭，并给反向数据最多 30 秒排空；复制或半关闭出错则关闭两端。排空超时会中断读写并关闭连接，也覆盖阻塞的写入和半关闭操作，结束前等待转发协程退出。
 
@@ -451,6 +476,8 @@ agent 的回包处理仍是读取一个业务 UDP 包、写入隧道，再读取
 | `-kcp-sndwnd` | 两端 | `128`；本端 KCP 发送窗口，范围 `128..4096` 分段；要求 KCP 池 |
 | `-kcp-rcvwnd` | 两端 | `128`；本端 KCP 接收窗口，范围 `128..4096` 分段；要求 KCP 池 |
 | `-kcp-nocwnd` | 两端 | `true`；默认关闭 KCP 拥塞控制，`-kcp-nocwnd=false` 开启；只影响本端发送；要求 KCP 池 |
+| `-kcp-ack-nodelay` | 两端 | `false`；默认按 20ms 更新周期合并 ACK，`true` 恢复立即 ACK；两端可以不同；要求 KCP 池 |
+| `-kcp-native-udp` | 两端 | `false`；启用与 KCP 地址、端口和 PSK 相同的原生 UDP/DTLS 池；无需第二个地址；不可再指定 `dtls://` |
 | `-kcp-fec` | 两端 | `off`；可设 `10:3` 等 `数据数:纠错数`（每项 `1..32`）；两端必须一致；要求 KCP 池 |
 | `-kcp-heartbeat` | 两端 | `10s`；KCP/DTLS 心跳间隔；要求 KCP 池 |
 | `-kcp-timeout` | 两端 | `30s`；KCP/DTLS 有效心跳回复超时，至少为心跳的三倍；要求 KCP 池 |
@@ -482,6 +509,8 @@ gonc 依赖固定到提交 `41d3f96c03fec9fbcf7ed9524b61792fca61ebee`，对应�
 KCP 测试另外覆盖丢包、乱序、重复包、尾部数据与半关闭、关闭确认丢失、单向链路失效、背压与动态 deadline、协议错误、真实 DTLS 认证、agent 中断、server 重启补池、KCP 单独运行及与原生 DTLS 共存。可用 `go test -race . -run TestKCP` 执行 KCP 并发检查。
 
 v1.6.0 的测试还覆盖拥塞控制开关的实际发送行为、FEC 恢复计数、数据/纠错包 MTU 上限、FEC 参数不匹配拒绝，以及启用 FEC 的真实进程转发和补池。设置环境变量 `BACKPIPE_LEGACY_KCP_BINARY` 为单独编译的 v1.5.0 可执行文件路径后，运行 `go test -race . -run TestLegacyKCPBinaryCompatibility` 可检查不启用 FEC 时两个升级顺序下的 TCP 半关闭及 UDP 互通。
+
+v1.7.0 增加立即/合并 ACK 下的高延迟、丢包与半关闭测试、控制写入阻塞时的接收进度、pong 合并与控制优先发送、关闭打断等待，以及四条 KCP 流停滞时经真实 SOCKS5/同端口 DTLS 通道完成 DNS 查询和补池的测试。后者只对停滞 KCP 流的载体注入模拟黑洞，验证通道独立性，不模拟共享公网带宽。同端口测试还覆盖认证、首包记录边界、未知协议拒绝、分类超时、取消清理、启动失败释放端口，以及真实进程中的 FEC、UDP 切片、半关闭和断线补池。`BACKPIPE_LEGACY_KCP_FEC_BINARY` 可指向 v1.6.0 可执行文件，用 `TestLegacyKCPFECBinaryCompatibility` 验证 FEC 10:3 在两个升级顺序下互通。
 
 升级兼容性测试可指定独立构建的 v1.4.2 程序：`BACKPIPE_LEGACY_BINARY=/absolute/path/to/backpipe-v1.4.2 go test . -run TestLegacyBinaryCompatibility`。测试覆盖新旧 server/agent 的两种搭配，以及 TCP、TLS、TLS 加原生 DTLS、仅原生 DTLS 四种配置；未指定旧程序时跳过此项。
 

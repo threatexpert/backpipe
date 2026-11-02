@@ -12,9 +12,11 @@ import (
 )
 
 func TestKCPDTLSPoolAndCoexistence(t *testing.T) {
-	for _, mode := range []string{"kcp-only", "native-udp", "forced-stream", "fec-only", "fec-native-udp"} {
+	for _, mode := range []string{"kcp-only", "native-udp", "forced-stream", "fec-only", "fec-native-udp", "shared-udp", "fec-shared-udp", "shared-forced-stream"} {
 		t.Run(mode, func(t *testing.T) {
-			native := mode == "native-udp" || mode == "forced-stream" || mode == "fec-native-udp"
+			shared := strings.Contains(mode, "shared-")
+			native := shared || mode == "native-udp" || mode == "forced-stream" || mode == "fec-native-udp"
+			forced := strings.Contains(mode, "forced-stream")
 			fec := strings.HasPrefix(mode, "fec-")
 			key := "kcp-integration-key"
 			target := tcpEcho(t, false)
@@ -28,14 +30,19 @@ func TestKCPDTLSPoolAndCoexistence(t *testing.T) {
 			if fec {
 				args = append(args, "-kcp-fec", "10:3")
 			}
-			if native {
+			if shared {
+				args = append(args, "-kcp-native-udp", "-udp-mtu", "900")
+			} else if native {
 				args = append(args, "-accept", "dtls://127.0.0.1:0?psk="+key)
 			}
-			if mode == "forced-stream" {
+			if forced {
 				args = append(args, "-udp-transport", "stream")
 			}
 			server := startProcess(t, args...)
 			entries := entryAddresses(t, server, 3)
+			if shared && listenerAddress(t, server, "agent") != listenerAddress(t, server, "UDP agent") {
+				t.Fatal("shared mode bound a second UDP port")
+			}
 			agentArgs := []string{"agent", "-connect", "kcp+dtls://" + listenerAddress(t, server, "agent") + "?psk=" + key,
 				"-pool", "1", "-kcp-heartbeat", "100ms", "-kcp-timeout", "1s"}
 			if mode == "kcp-only" {
@@ -44,7 +51,9 @@ func TestKCPDTLSPoolAndCoexistence(t *testing.T) {
 			if fec {
 				agentArgs = append(agentArgs, "-kcp-fec", "10:3")
 			}
-			if native {
+			if shared {
+				agentArgs = append(agentArgs, "-kcp-native-udp", "-udp-pool", "1", "-udp-mtu", "1400")
+			} else if native {
 				agentArgs = append(agentArgs, "-connect", "dtls://"+listenerAddress(t, server, "UDP agent")+"?psk="+key, "-udp-pool", "1")
 			}
 			agent := startProcess(t, agentArgs...)
@@ -102,7 +111,7 @@ func TestKCPDTLSPoolAndCoexistence(t *testing.T) {
 			}
 			forwardUDPRoundTrip(t, u, fixedUDP, []byte("fixed-udp"))
 			want := "transport=kcp+dtls"
-			if mode == "native-udp" || mode == "fec-native-udp" {
+			if native && !forced {
 				want = "transport=dtls"
 			}
 			if !strings.Contains(server.logs.String(), want) {
@@ -127,6 +136,11 @@ func TestKCPDTLSPoolAndCoexistence(t *testing.T) {
 			recovered.Write([]byte("recovered"))
 			expectBytes(t, recovered, []byte("recovered"))
 			recovered.Close()
+			if shared && !forced {
+				// Start a new association: interrupted native UDP associations
+				// never migrate/replay onto a replacement agent.
+				forwardUDPRoundTrip(t, forwardUDPClient(t), fixedUDP, []byte("native-recovered"))
+			}
 		})
 	}
 }

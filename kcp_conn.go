@@ -38,6 +38,7 @@ type kcpSettings struct {
 	MTU                              int
 	SendWindow, ReceiveWindow        int
 	NoCongestion                     bool
+	ACKNoDelay                       bool
 	FECData, FECParity               int
 	Heartbeat, Timeout, CloseTimeout time.Duration
 }
@@ -101,6 +102,22 @@ type kcpPackets struct {
 	finSent     atomic.Bool
 	finAck      chan struct{}
 	finAckOnce  sync.Once
+	// ReadFrom has exactly one caller. Controls keep only the latest pong
+	// and a pending FIN acknowledgment, independent of receive progress.
+	readBuffer  [8192]byte
+	controlMu   sync.Mutex
+	pong        uint64
+	pongPending bool
+	finPending  bool
+	controlWake chan struct{}
+	controlDone chan struct{}
+}
+
+func newKCPPackets(conn net.Conn, cfg kcpSettings) *kcpPackets {
+	p := &kcpPackets{conn: conn, cfg: cfg, done: make(chan struct{}), writeGate: make(chan struct{}, 1), lastPong: time.Now(), finAck: make(chan struct{}), controlWake: make(chan struct{}, 1), controlDone: make(chan struct{})}
+	p.writeGate <- struct{}{}
+	go p.controlWriter()
+	return p
 }
 
 func (p *kcpPackets) fail(err error) {
@@ -121,17 +138,51 @@ func (p *kcpPackets) terminal() error {
 	return p.err
 }
 
-func (p *kcpPackets) send(kind byte, payload []byte) error {
+func (p *kcpPackets) lockSend() error {
+	select {
+	case <-p.done:
+		return p.terminal()
+	default:
+	}
+	// The normal, uncontended packet path needs no timer allocation.
+	select {
+	case <-p.writeGate:
+		return nil
+	default:
+	}
 	timer := time.NewTimer(p.cfg.Timeout)
 	defer timer.Stop()
 	select {
 	case <-p.done:
 		return p.terminal()
 	case <-timer.C:
+		p.fail(os.ErrDeadlineExceeded)
 		return os.ErrDeadlineExceeded
 	case <-p.writeGate:
+		return nil
+	}
+}
+
+func (p *kcpPackets) send(kind byte, payload []byte) error {
+	if err := p.lockSend(); err != nil {
+		return err
 	}
 	defer func() { p.writeGate <- struct{}{} }()
+	// A bounded snapshot lets controls precede the next data packet without
+	// starving data when a peer sends a continuous stream of pings.
+	if err := p.flushControls(); err != nil {
+		return err
+	}
+	return p.writeRecord(kind, payload)
+}
+
+// Caller owns writeGate; scheduling always precedes DTLS sequence assignment.
+func (p *kcpPackets) writeRecord(kind byte, payload []byte) error {
+	select {
+	case <-p.done:
+		return p.terminal()
+	default:
+	}
 	headerSize := kcpEnvelopeSize
 	if kind == kcpPacketFECData {
 		headerSize += 2
@@ -154,8 +205,65 @@ func (p *kcpPackets) send(kind byte, payload []byte) error {
 	return err
 }
 
+func (p *kcpPackets) queueControl(kind byte, seq uint64) {
+	p.controlMu.Lock()
+	if kind == kcpPacketPong {
+		// Keep the newest sequence even when records arrive out of order.
+		if seq > p.pong {
+			p.pong = seq
+		}
+		p.pongPending = true
+	} else {
+		p.finPending = true
+	}
+	p.controlMu.Unlock()
+	select {
+	case p.controlWake <- struct{}{}:
+	default:
+	}
+}
+
+// Caller owns writeGate. Clear only the snapshot; newly queued controls remain
+// pending and carry their own wakeup while these writes are in progress.
+func (p *kcpPackets) flushControls() error {
+	p.controlMu.Lock()
+	fin, pong, seq := p.finPending, p.pongPending, p.pong
+	p.finPending, p.pongPending = false, false
+	p.controlMu.Unlock()
+	if fin {
+		if err := p.writeRecord(kcpPacketFINACK, nil); err != nil {
+			return err
+		}
+	}
+	if pong {
+		var payload [8]byte
+		binary.BigEndian.PutUint64(payload[:], seq)
+		return p.writeRecord(kcpPacketPong, payload[:])
+	}
+	return nil
+}
+
+func (p *kcpPackets) controlWriter() {
+	defer close(p.controlDone)
+	for {
+		select {
+		case <-p.done:
+			return
+		case <-p.controlWake:
+		}
+		if err := p.lockSend(); err != nil {
+			return
+		}
+		err := p.flushControls()
+		p.writeGate <- struct{}{}
+		if err != nil {
+			return
+		}
+	}
+}
+
 func (p *kcpPackets) ReadFrom(b []byte) (int, net.Addr, error) {
-	buf := make([]byte, 8192)
+	buf := p.readBuffer[:]
 	for {
 		n, err := p.conn.Read(buf)
 		if err != nil {
@@ -195,9 +303,7 @@ func (p *kcpPackets) ReadFrom(b []byte) (int, net.Addr, error) {
 			if len(payload) != 8 {
 				break
 			}
-			if err := p.send(kcpPacketPong, payload); err != nil {
-				return 0, nil, err
-			}
+			p.queueControl(kcpPacketPong, binary.BigEndian.Uint64(payload))
 			continue
 		case kcpPacketPong:
 			if len(payload) != 8 {
@@ -239,7 +345,11 @@ func (p *kcpPackets) WriteTo(b []byte, _ net.Addr) (int, error) {
 	}
 	return len(b), nil
 }
-func (p *kcpPackets) Close() error                       { p.fail(net.ErrClosed); return nil }
+func (p *kcpPackets) Close() error {
+	p.fail(net.ErrClosed)
+	<-p.controlDone
+	return nil
+}
 func (p *kcpPackets) LocalAddr() net.Addr                { return p.conn.LocalAddr() }
 func (p *kcpPackets) SetDeadline(t time.Time) error      { return p.conn.SetDeadline(t) }
 func (p *kcpPackets) SetReadDeadline(t time.Time) error  { return p.conn.SetReadDeadline(t) }
@@ -289,10 +399,7 @@ func (p *kcpPackets) heartbeat() {
 				lastPing = now
 			}
 			if p.finReceived.Load() {
-				if err := p.send(kcpPacketFINACK, nil); err != nil {
-					p.fail(err)
-					return
-				}
+				p.queueControl(kcpPacketFINACK, 0)
 			}
 		}
 	}
@@ -321,8 +428,7 @@ func newKCPStream(conn net.Conn, cfg kcpSettings) (*kcpStreamConn, error) {
 	if cfg.MTU < 576 || cfg.MTU > 1400 || !validKCPWindow(cfg.SendWindow) || !validKCPWindow(cfg.ReceiveWindow) || !cfg.validFEC() || cfg.Heartbeat <= 0 || cfg.Timeout < 3*cfg.Heartbeat || cfg.CloseTimeout <= 0 {
 		return nil, fmt.Errorf("invalid KCP settings")
 	}
-	p := &kcpPackets{conn: conn, cfg: cfg, done: make(chan struct{}), writeGate: make(chan struct{}, 1), lastPong: time.Now(), finAck: make(chan struct{})}
-	p.writeGate <- struct{}{}
+	p := newKCPPackets(conn, cfg)
 	// DTLS already authenticates and encrypts every KCP/FEC packet.
 	sess, err := kcp.NewConn4(0, conn.RemoteAddr(), nil, cfg.FECData, cfg.FECParity, true, p)
 	if err != nil {
@@ -336,7 +442,7 @@ func newKCPStream(conn net.Conn, cfg kcpSettings) (*kcpStreamConn, error) {
 	}
 	sess.SetNoDelay(1, 20, 2, nocwnd)
 	sess.SetWindowSize(cfg.SendWindow, cfg.ReceiveWindow)
-	sess.SetACKNoDelay(true)
+	sess.SetACKNoDelay(cfg.ACKNoDelay)
 	// SetMtu already deducts kcp-go's FEC header (8 bytes when enabled).
 	// Reserve only our envelope and the DTLS record overhead here.
 	if !sess.SetMtu(cfg.MTU - datagramRecordOverhead - cfg.packetHeaderSize()) {
@@ -456,10 +562,7 @@ func (c *kcpStreamConn) readFrames() {
 			c.mu.Unlock()
 			c.packets.finReceived.Store(true)
 			// ACK is repeated by the carrier heartbeat until it is closed.
-			if err := c.packets.send(kcpPacketFINACK, nil); err != nil {
-				c.abort(err)
-				return
-			}
+			c.packets.queueControl(kcpPacketFINACK, 0)
 		default:
 			c.abort(fmt.Errorf("invalid KCP stream frame"))
 			return

@@ -7,6 +7,7 @@ require (
 	github.com/pion/transport/v5 v5.0.0
 	github.com/threatexpert/gonc/v2 v2.6.11-0.20261013082942-41d3f96c03fe
 	github.com/xtaci/kcp-go/v5 v5.6.72
+	golang.org/x/net v0.59.0
 )
 
 require (
@@ -28,7 +29,6 @@ require (
 	github.com/xtaci/smux v1.5.57 // indirect
 	github.com/zeebo/blake3 v0.2.4 // indirect
 	golang.org/x/crypto v0.57.0 // indirect
-	golang.org/x/net v0.59.0 // indirect
 	golang.org/x/sync v0.21.0 // indirect
 	golang.org/x/sys v0.48.0 // indirect
 	golang.org/x/term v0.46.0 // indirect
